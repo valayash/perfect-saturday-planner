@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { StreamStalled, streamPlan } from "../lib/stream";
+import { StreamStalled, fetchRunResult, runPlanJson, streamPlan } from "../lib/stream";
 import type { AgentEvent, Plan, PlanRequest, Preferences, TraceItem } from "../lib/types";
 import InputPanel from "./InputPanel";
 import PlanView from "./PlanView";
@@ -68,25 +68,7 @@ export default function Planner() {
     }
   };
 
-  /** One streamed attempt. Returns null on success, or the failure and whether a retry could help. */
-  const attemptOnce = async (req: PlanRequest, ctrl: AbortController): Promise<{ failure: string; retryable: boolean } | null> => {
-    const t0 = Date.now();
-    setStartedAt(t0);
-    let sawEnd = false;
-    try {
-      await streamPlan(req, (e) => {
-        if (e.type === "plan" || e.type === "clarify" || e.type === "error") sawEnd = true;
-        handle(e);
-      }, ctrl.signal);
-      return sawEnd ? null : { failure: "The connection closed before the plan was ready.", retryable: true };
-    } catch (err) {
-      if (ctrl.signal.aborted || sawEnd) return null;
-      const dropped = err instanceof StreamStalled || err instanceof TypeError; // stalled or network error
-      return { failure: dropped ? "The connection to the planner stalled." : err instanceof Error ? err.message : "Network error", retryable: dropped };
-    } finally {
-      setDoneSeconds((s) => s ?? Math.round((Date.now() - t0) / 100) / 10);
-    }
-  };
+  const note = (message: string) => setTrace((t) => [...t, { kind: "status", id: `status-note-${t.length}`, message, tone: "info" }]);
 
   const start = async (req: PlanRequest) => {
     abort.current?.abort();
@@ -101,16 +83,47 @@ export default function Planner() {
     setQuestions([]);
     setDoneSeconds(null);
     requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    let result = await attemptOnce(req, ctrl);
-    if (result?.retryable && !ctrl.signal.aborted) {
-      // Streams through serverless platforms occasionally stall; one automatic retry usually gets through.
-      const note = `${result.failure} Retrying once…`;
-      setTrace((t) => [...t, { kind: "status", id: `status-retry-${t.length}`, message: note }]);
-      setDoneSeconds(null);
-      result = await attemptOnce(req, ctrl);
+    const t0 = Date.now();
+    setStartedAt(t0);
+
+    let seen = 0;
+    let sawEnd = false;
+    const onEvent = (e: AgentEvent) => {
+      seen += 1;
+      if (e.type === "plan" || e.type === "clarify" || e.type === "error") sawEnd = true;
+      handle(e);
+    };
+    const runId = crypto.randomUUID();
+    let failure: string | null = null;
+    try {
+      // 1. Live stream (normal path).
+      try {
+        await streamPlan({ ...req, run_id: runId }, onEvent, ctrl.signal);
+      } catch (err) {
+        if (!(err instanceof StreamStalled || err instanceof TypeError)) throw err; // e.g. 429/400: don't retry
+      }
+      // 2. The stream stalled or dropped in transit: the server keeps every run, so collect the rest of it.
+      if (!sawEnd && !ctrl.signal.aborted) {
+        note("Live updates stalled in transit. Collecting the rest of the run from the server…");
+        const events = await fetchRunResult(runId, ctrl.signal);
+        if (events) {
+          events.slice(seen).forEach(onEvent);
+        } else {
+          // 3. A different server instance answered: run once more without live updates.
+          note("That server instance is gone, so I'm planning once more without live updates (about 30–60 s)…");
+          setTrace((t) => t.filter((i) => i.kind === "status"));
+          seen = 0;
+          (await runPlanJson({ ...req, run_id: crypto.randomUUID() }, ctrl.signal)).forEach(onEvent);
+        }
+      }
+      if (!sawEnd) failure = "The planner didn't return a result.";
+    } catch (err) {
+      if (!ctrl.signal.aborted) failure = err instanceof Error ? err.message : "Network error";
+    } finally {
+      setDoneSeconds((s) => s ?? Math.round((Date.now() - t0) / 100) / 10);
     }
-    if (result && !ctrl.signal.aborted) {
-      setError({ message: `${result.failure} Please try again.`, retryable: true });
+    if (failure && !sawEnd && !ctrl.signal.aborted) {
+      setError({ message: `${failure} Please try again.`, retryable: true });
       setPhase("error");
     }
   };

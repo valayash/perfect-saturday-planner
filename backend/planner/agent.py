@@ -156,7 +156,7 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         gemini = None
 
     # 1. understand preferences
-    ev, sid, t0 = steps.start("parse_preferences", "Understanding your preferences", req.model_dump(exclude_none=True, exclude_defaults=True))
+    ev, sid, t0 = steps.start("parse_preferences", "Understanding your preferences", req.model_dump(exclude={"run_id"}, exclude_none=True, exclude_defaults=True))
     yield ev
     prefs, parse_source = await parse_preferences(gemini, req, gateway)
     yield steps.end(sid, t0, f"{prefs.city or 'no city'} · {prefs.available_minutes} min · {prefs.energy} energy" + (" (rule-based: AI unavailable)" if parse_source == "rules" else ""), source=parse_source, output=prefs.model_dump())

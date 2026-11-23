@@ -11,6 +11,7 @@ export type PlanRequest = {
   constraints?: string[];
   free_text?: string;
   clarifications?: Clarification[];
+  run_id?: string;
 };
 
 export type Preferences = {

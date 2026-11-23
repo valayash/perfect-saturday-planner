@@ -57,3 +57,29 @@ export async function streamPlan(
   }
   if (stalled) throw new StreamStalled("The connection to the planner stalled.");
 }
+
+/** Collect a run's stored events (the server waits until it finishes). null if another server instance ran it. */
+export async function fetchRunResult(runId: string, signal: AbortSignal): Promise<AgentEvent[] | null> {
+  const res = await fetch(`/api/plan/${encodeURIComponent(runId)}`, { signal });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Couldn't collect the result (${res.status})`);
+  return ((await res.json()) as { events: AgentEvent[] }).events;
+}
+
+/** Non-streaming fallback: run the whole plan and get every event in one ordinary response. */
+export async function runPlanJson(payload: PlanRequest, signal: AbortSignal): Promise<AgentEvent[]> {
+  const res = await fetch("/api/plan?mode=json", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) {
+    let message = `Request failed (${res.status})`;
+    try {
+      message = (await res.json()).error ?? message;
+    } catch {}
+    throw new Error(message);
+  }
+  return ((await res.json()) as { events: AgentEvent[] }).events;
+}

@@ -122,7 +122,7 @@ def heuristic_preferences(req: PlanRequest) -> Preferences:
 
 
 def _request_text(req: PlanRequest) -> str:
-    fields = req.model_dump(exclude={"free_text", "clarifications"}, exclude_none=True)
+    fields = req.model_dump(exclude={"free_text", "clarifications", "run_id"}, exclude_none=True)
     fields = {k: v for k, v in fields.items() if v not in ([], "")}
     parts = [f"Structured fields: {json.dumps(fields, ensure_ascii=False)}"]
     if req.free_text:

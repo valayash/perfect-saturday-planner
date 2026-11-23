@@ -28,6 +28,7 @@ class PlanRequest(BaseModel):
     constraints: list[str] = Field(default_factory=list, max_length=12)
     free_text: str | None = Field(default=None, max_length=1500)
     clarifications: list[Clarification] = Field(default_factory=list, max_length=4)
+    run_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9-]+$")  # lets the browser re-fetch a run
 
 
 # ---------- parsed preferences ----------
