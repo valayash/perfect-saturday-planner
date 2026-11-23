@@ -137,7 +137,7 @@ PARSE_BUDGET_S = 20
 
 async def parse_preferences(client: genai.Client | None, req: PlanRequest) -> tuple[Preferences, str]:
     """Returns (preferences, source) where source is 'gemini' or 'rules'."""
-    fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-4-hydrogen").split(",") if m.strip()]
+    fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
     prefs, source = None, "rules"
     deadline = time.monotonic() + PARSE_BUDGET_S  # an overloaded Gemini should cost seconds, not a minute
     models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client else {}  # fast model first, then the rest of the chain
