@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -10,6 +12,8 @@ import httpx2
 from .models import Location
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+CACHE_S = 1800
+_cache: dict[tuple, tuple[float, dict]] = {}
 
 WMO = {
     0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
@@ -40,10 +44,24 @@ async def saturday_forecast(loc: Location, start_hhmm: str, minutes: int) -> dic
         "start_date": day.isoformat(),
         "end_date": day.isoformat(),
     }
-    async with httpx2.AsyncClient() as client:
-        resp = await client.get(FORECAST_URL, params=params, timeout=6.0)
-        resp.raise_for_status()
-        data = resp.json()
+    key = (round(loc.lat, 2), round(loc.lon, 2), day.isoformat())
+    cached = _cache.get(key)
+    if cached and time.monotonic() - cached[0] < CACHE_S:
+        data = cached[1]
+    else:
+        data = None
+        async with httpx2.AsyncClient() as client:
+            for attempt in range(2):  # Open-Meteo occasionally returns a transient 503
+                try:
+                    resp = await client.get(FORECAST_URL, params=params, timeout=6.0)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except httpx2.HTTPError:
+                    if attempt:
+                        raise
+                    await asyncio.sleep(0.8)
+        _cache[key] = (time.monotonic(), data)
 
     start_h = int(start_hhmm.split(":")[0])
     end_h = min(23, start_h + max(1, round(minutes / 60)))
