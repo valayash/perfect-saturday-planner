@@ -1,0 +1,15 @@
+[project]
+name = "saturday-planner-api"
+version = "0.1.0"
+description = "Perfect Saturday Planner agent API (FastAPI + Gemini)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.165.0",
+    "google-genai>=3.6.1",
+    "tzdata>=2026.6",
+]
+
+[dependency-groups]
+dev = [
+    "uvicorn>=0.54.0",
+]

@@ -1,0 +1,22 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# node / next
+frontend/node_modules/
+frontend/.next/
+frontend/next-env.d.ts
+
+# vercel
+.vercel
+
+.DS_Store
+
+# local agent tooling
+.claude/
