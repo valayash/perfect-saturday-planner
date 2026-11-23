@@ -1,0 +1,11 @@
+# never upload local secrets or build artefacts
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+**/.venv
+**/node_modules
+**/.next
+**/__pycache__
+.claude
