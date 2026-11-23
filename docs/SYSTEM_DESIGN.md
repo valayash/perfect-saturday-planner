@@ -37,8 +37,9 @@ flowchart LR
     end
     A --- Agent
 
-    LOOP -- "generateContent (stream)" --> G[("Gemini API<br/>model fallback chain")]
-    P -- "structured JSON" --> G
+    LOOP -- "chat completions + tools" --> GW[("Vercel AI Gateway<br/>gpt-oss-120b, Claude Haiku 5.5,<br/>Gemini Flash-Lite")]
+    LOOP -. "if the gateway fails" .-> G[("Gemini API<br/>model fallback chain")]
+    P -- "structured JSON" --> GW
     T -- "forecast" --> OM[("Open-Meteo<br/>weather + geocoding")]
     T -- "POIs, rich tags" --> OP[("OSM Overpass")]
     T -- "POIs, fast search" --> PH[("OSM Photon")]
@@ -49,7 +50,7 @@ flowchart LR
 |---|---|---|
 | **web** service | Next.js 16, React 19, Tailwind 4 | Form or free-text input, clarification prompts, live trace, plan rendering |
 | **api** service | FastAPI, Python 3.12 | Streams the agent run as Server-Sent Events; rate limiting; keep-alives |
-| Agent runtime | `google-genai` SDK | Preference parsing, the tool loop, model fallback, rule-based fallback |
+| Agent runtime | `openai` SDK (AI Gateway), `google-genai` SDK | Preference parsing, the tool loop, provider and model fallback, rule-based fallback |
 | Tools | Python, `httpx2` | Weather, places, cost and validation; all facts come from here |
 | External data | Open-Meteo, OSM Overpass, OSM Photon | Free, keyless, real data |
 
@@ -161,7 +162,18 @@ stateDiagram-v2
 
 ---
 
-## 5. Model strategy (Gemini)
+## 5. Model strategy
+
+**Provider chain:** Vercel AI Gateway → Gemini API → rule-based planner. Each stage hands the next one the work gathered so far (forecast, places found, last draft), so nothing is fetched twice.
+
+| Stage | Models (in order) | Auth | Notes |
+|---|---|---|---|
+| Vercel AI Gateway | `openai/gpt-oss-120b` → `anthropic/claude-haiku-5.5` → `google/gemini-3.5-flash-lite` | The project's **OIDC token** on Vercel (no key to manage); `AI_GATEWAY_API_KEY` locally | OpenAI-format JSON history, so switching models mid-run is safe; ≈ $0.005 per plan on gpt-oss-120b |
+| Gemini API | the table below | `GEMINI_API_KEY` | Used when the gateway is unavailable |
+| Rules | none | none | Same tools and validator, no LLM |
+
+The gateway was added after Gemini's free tier returned 503 "high demand" for every model for hours during testing. The direct Gemini path is unchanged:
+
 
 | Use | Default model | Thinking | Why |
 |---|---|---|---|

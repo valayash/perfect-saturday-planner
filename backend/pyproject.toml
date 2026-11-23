@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.165.0",
     "google-genai>=3.6.1",
+    "openai>=3.58.0",
     "tzdata>=2026.6",
 ]
 

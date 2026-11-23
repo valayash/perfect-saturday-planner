@@ -1,4 +1,4 @@
-"""parse_preferences: Gemini structured output, with a rule-based fallback."""
+"""parse_preferences: structured output via AI Gateway or Gemini, with a rule-based fallback."""
 
 from __future__ import annotations
 
@@ -11,8 +11,10 @@ import time
 
 from google import genai
 from google.genai import types
+from openai import AsyncOpenAI
 
 from .fallback_data import CITY_KEYS
+from .gateway import GATEWAY_MODELS, error_text, is_account_problem
 from .models import PlanRequest, Preferences
 from .prompts import PARSE_SYSTEM
 
@@ -135,12 +137,38 @@ PARSE_MODEL = os.getenv("GEMINI_PARSE_MODEL", "gemini-3.5-flash-lite")
 PARSE_BUDGET_S = 20
 
 
-async def parse_preferences(client: genai.Client | None, req: PlanRequest) -> tuple[Preferences, str]:
-    """Returns (preferences, source) where source is 'gemini' or 'rules'."""
+async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: float) -> Preferences | None:
+    for model in GATEWAY_MODELS:
+        remaining = deadline - time.monotonic()
+        if remaining < 3:
+            return None
+        try:
+            resp = await asyncio.wait_for(
+                gateway.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system", "content": PARSE_SYSTEM}, {"role": "user", "content": _request_text(req)}],
+                    response_format={"type": "json_schema", "json_schema": {"name": "preferences", "schema": Preferences.model_json_schema()}},
+                    max_tokens=4000,
+                ),
+                timeout=min(remaining, 12),
+            )
+            return Preferences.model_validate_json(resp.choices[0].message.content or "")
+        except Exception as err:
+            log.warning("parse_preferences failed on gateway %s: %s", model, error_text(err))
+            if is_account_problem(err):  # e.g. no card on file: no gateway model will work
+                return None
+    return None
+
+
+async def parse_preferences(client: genai.Client | None, req: PlanRequest, gateway: AsyncOpenAI | None = None) -> tuple[Preferences, str]:
+    """Returns (preferences, source) where source is 'gateway', 'gemini' or 'rules'."""
     fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
     prefs, source = None, "rules"
-    deadline = time.monotonic() + PARSE_BUDGET_S  # an overloaded Gemini should cost seconds, not a minute
-    models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client else {}  # fast model first, then the rest of the chain
+    deadline = time.monotonic() + PARSE_BUDGET_S  # an overloaded model should cost seconds, not a minute
+    if gateway:
+        prefs = await _parse_with_gateway(gateway, req, deadline)
+        source = "gateway" if prefs else "rules"
+    models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client and not prefs else {}  # fast model first, then the chain
     for model in models:
         remaining = deadline - time.monotonic()
         if remaining < 3:

@@ -67,7 +67,7 @@ async def plan(req: PlanRequest, request: Request):
 
         async def produce():
             try:
-                async for event in run(req):
+                async for event in run(req, oidc_token=request.headers.get("x-vercel-oidc-token")):
                     await queue.put(event)
             except Exception:
                 log.exception("agent crashed")

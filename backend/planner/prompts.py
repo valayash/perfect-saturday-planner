@@ -32,5 +32,6 @@ Plan quality:
 - Always give a plan_b: what to do if it rains or a place is closed or packed, using real place_ids where possible.
 - If searches return few or no options, widen the radius once or try other categories, then work with what you have and say so honestly in the summary.
 - If one of the user's interests can't be served (e.g. no live music venue nearby), say so in tradeoffs instead of silently dropping it.
+- Never invent facts the tools didn't give you (menu items, guided tours, exact prices, typical crowd days). Tips should be practical and general, e.g. "check today's exhibition before going". Remember the plan is for a Saturday.
 - Between tool calls, write at most one short sentence about what you are doing next.
 """
