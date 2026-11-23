@@ -14,12 +14,18 @@ from openai import AsyncOpenAI
 from .tools import TOOL_SPECS
 
 GATEWAY_URL = "https://ai-gateway.vercel.sh/v1"
-# Defaults are all on AI Gateway's free tier, support tool calling and JSON-schema output, and come from different model families.
-GATEWAY_MODELS = [
-    m.strip()
-    for m in os.getenv("AI_GATEWAY_MODELS", "openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash").split(",")
-    if m.strip()
-]
+
+
+def _models(env: str, default: str) -> list[str]:
+    return [m.strip() for m in os.getenv(env, default).split(",") if m.strip()]
+
+
+# Defaults are all on AI Gateway's free tier, support tool calling and JSON-schema output, and come from different families.
+GATEWAY_MODELS = _models("AI_GATEWAY_MODELS", "openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash")
+# Parsing is a small extraction job: a small model on fast hardware answers in well under a second.
+PARSE_MODELS = _models("AI_GATEWAY_PARSE_MODELS", "openai/gpt-oss-20b,openai/gpt-oss-120b,google/gemini-2.5-flash-lite")
+# Open-weights models run on several providers; Cerebras and Groq serve them at hundreds of tokens per second.
+FAST_PROVIDERS = _models("AI_GATEWAY_FAST_PROVIDERS", "cerebras,groq")
 
 OPENAI_TOOLS = [
     {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
@@ -27,8 +33,11 @@ OPENAI_TOOLS = [
 ]
 
 
-class GatewayUnavailable(Exception):
-    """The gateway can't serve this account right now (no card on file, bad credentials): skip it for this run."""
+def request_options(model: str) -> dict:
+    """Per-model extras: prefer fast providers and low reasoning effort for the gpt-oss family."""
+    if model.startswith("openai/gpt-oss"):
+        return {"reasoning_effort": "low", "extra_body": {"providerOptions": {"gateway": {"order": FAST_PROVIDERS}}}}
+    return {}
 
 
 def gateway_client(oidc_token: str | None) -> AsyncOpenAI | None:

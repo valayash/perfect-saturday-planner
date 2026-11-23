@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+import re
 
 import httpx2
 
@@ -17,6 +19,40 @@ USER_AGENT = "perfect-saturday-planner/1.0 (take-home demo)"
 ALIASES = {"bangalore": "Bengaluru", "bombay": "Mumbai", "madras": "Chennai", "calcutta": "Kolkata", "gurgaon": "Gurugram"}
 
 _cache: dict[tuple[str, str | None], list[dict]] = {}
+
+# Popular neighbourhoods, so common areas resolve instantly and to the right side of town
+# (e.g. the "Bandra" in geocoders is Bandra East, but people mean the Bandra West of Carter Road).
+AREA_ANCHORS: dict[str, dict[str, tuple[float, float]]] = {
+    "bengaluru": {
+        "indiranagar": (12.9719, 77.6412), "koramangala": (12.9352, 77.6245), "mg road": (12.9756, 77.6066),
+        "church street": (12.9750, 77.6046), "jayanagar": (12.9250, 77.5938), "whitefield": (12.9698, 77.7500),
+        "hsr layout": (12.9116, 77.6474), "malleshwaram": (13.0035, 77.5710), "basavanagudi": (12.9417, 77.5755),
+        "jp nagar": (12.9063, 77.5857), "hebbal": (13.0358, 77.5970), "electronic city": (12.8452, 77.6602),
+    },
+    "mumbai": {
+        "bandra": (19.0596, 72.8295), "bandra west": (19.0596, 72.8295), "colaba": (18.9067, 72.8147), "fort": (18.9330, 72.8340),
+        "juhu": (19.1075, 72.8263), "andheri west": (19.1364, 72.8296), "andheri": (19.1197, 72.8468), "lower parel": (18.9966, 72.8295),
+        "powai": (19.1176, 72.9060), "dadar": (19.0178, 72.8478), "churchgate": (18.9322, 72.8264), "kala ghoda": (18.9282, 72.8315),
+    },
+    "delhi": {
+        "khan market": (28.6002, 77.2270), "hauz khas": (28.5494, 77.2001), "connaught place": (28.6315, 77.2167), "cp": (28.6315, 77.2167),
+        "saket": (28.5245, 77.2066), "lodhi colony": (28.5850, 77.2230), "chandni chowk": (28.6506, 77.2303),
+        "greater kailash": (28.5482, 77.2347), "vasant kunj": (28.5200, 77.1590),
+    },
+    "pune": {"koregaon park": (18.5362, 73.8940), "kalyani nagar": (18.5463, 73.9033), "baner": (18.5590, 73.7868)},
+    "gurugram": {"cyber hub": (28.4950, 77.0890), "cyber city": (28.4950, 77.0890)},
+}
+CITY_ANCHOR_KEYS = {"bengaluru": "bengaluru", "bangalore": "bengaluru", "mumbai": "mumbai", "bombay": "mumbai", "delhi": "delhi",
+                    "new delhi": "delhi", "pune": "pune", "gurugram": "gurugram", "gurgaon": "gurugram"}
+
+
+def _anchor(city: Location, area: str) -> Location | None:
+    key = CITY_ANCHOR_KEYS.get(city.name.strip().lower())
+    hit = AREA_ANCHORS.get(key or "", {}).get(re.sub(r"\s+", " ", area.strip().lower()))
+    if not hit:
+        return None
+    name = area.strip().title()
+    return city.model_copy(update={"name": name, "lat": hit[0], "lon": hit[1], "label": f"{name}, {city.label}"})
 
 
 class GeocodeError(Exception):
@@ -61,8 +97,8 @@ async def resolve_location(city: str, area: str | None, country_code: str | None
         best = max(results, key=lambda r: (r.get("population") or 0))
         city_loc = _to_location(best)
 
-        area_loc = None
-        if area:
+        area_loc = _anchor(city_loc, area) if area else None
+        if area and not area_loc:
             try:
                 candidates = await _search(client, area.strip(), city_loc.country_code or None)
             except httpx2.HTTPError:
@@ -76,12 +112,20 @@ async def resolve_location(city: str, area: str | None, country_code: str | None
 
 
 async def _photon_area(client: httpx2.AsyncClient, area: str, city: Location) -> Location | None:
-    try:
-        resp = await client.get(PHOTON_URL, params={"q": area, "lat": city.lat, "lon": city.lon, "limit": 5, "lang": "en"}, timeout=5.0)
-        resp.raise_for_status()
-        features = resp.json().get("features", [])
-    except (httpx2.HTTPError, ValueError):
-        return None
+    features: list = []
+    for attempt in range(3):  # the public Photon server briefly 503s under bursts
+        try:
+            resp = await client.get(PHOTON_URL, params={"q": area, "lat": city.lat, "lon": city.lon, "limit": 5, "lang": "en"}, timeout=5.0)
+            if resp.status_code in (429, 503) and attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            features = resp.json().get("features", [])
+            break
+        except (httpx2.HTTPError, ValueError):
+            if attempt == 2:
+                return None
+            await asyncio.sleep(0.5)
     for f in features:
         lon, lat = f["geometry"]["coordinates"]
         if haversine_km(city.lat, city.lon, lat, lon) < 35:

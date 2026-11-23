@@ -19,6 +19,7 @@ export default function Planner() {
   const [error, setError] = useState<{ message: string; retryable: boolean } | null>(null);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [doneSeconds, setDoneSeconds] = useState<number | null>(null);
+  const [llmStats, setLlmStats] = useState<{ calls: number; tokens: number } | null>(null);
   const lastRequest = useRef<PlanRequest | null>(null);
   const abort = useRef<AbortController | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
@@ -26,7 +27,7 @@ export default function Planner() {
   const handle = (e: AgentEvent) => {
     switch (e.type) {
       case "step_start":
-        setTrace((t) => [...t, { kind: "step", id: e.id, name: e.name, label: e.label, input: e.input, status: "running" }]);
+        setTrace((t) => [...t, { kind: "step", id: e.id, name: e.name, label: e.label, input: e.input, actor: e.actor, status: "running" }]);
         break;
       case "step_end":
         setTrace((t) =>
@@ -64,6 +65,7 @@ export default function Planner() {
         break;
       case "done":
         if (e.seconds) setDoneSeconds(e.seconds);
+        if (e.llm_calls !== undefined) setLlmStats({ calls: e.llm_calls, tokens: e.tokens ?? 0 });
         break;
     }
   };
@@ -82,6 +84,7 @@ export default function Planner() {
     setError(null);
     setQuestions([]);
     setDoneSeconds(null);
+    setLlmStats(null);
     requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
     const t0 = Date.now();
     setStartedAt(t0);
@@ -208,7 +211,7 @@ export default function Planner() {
 
           {plan && <PlanView plan={plan.plan} mode={plan.mode} model={plan.model} onReset={reset} />}
 
-          {phase !== "idle" && <TracePanel items={trace} running={running} startedAt={startedAt} doneSeconds={doneSeconds} />}
+          {phase !== "idle" && <TracePanel items={trace} running={running} startedAt={startedAt} doneSeconds={doneSeconds} llmStats={llmStats} />}
         </div>
       </div>
 

@@ -21,11 +21,15 @@ from .models import Location, Place
 from .pricing import category_meta
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-OVERPASS_TIMEOUT = 5.0
+OVERPASS_TIMEOUT = 1.5  # the public servers are usually at capacity; never let them hold up a plan
 OVERPASS_COOLDOWN = 600  # after a failure, skip Overpass for 10 minutes
 PHOTON_URL = "https://photon.komoot.io/api/"
 _overpass_down_until = 0.0
 _photon_slots = asyncio.Semaphore(3)
+_photon_down_until = 0.0
+PHOTON_COOLDOWN = 300
+_photon_cache: dict[tuple, tuple[float, list]] = {}
+PHOTON_CACHE_S = 1800
 
 # category -> [(search text, osm_tag filter)] for Photon
 PHOTON_QUERIES: dict[str, list[tuple[str, str]]] = {
@@ -160,15 +164,22 @@ async def _photon(categories: list[str], center: Location, radius_km: float, cou
 
     async def one(client: httpx2.AsyncClient, category: str, text: str, tag: str) -> list[Place]:
         params = {"q": text, "lat": center.lat, "lon": center.lon, "limit": 15, "osm_tag": tag, "bbox": bbox, "lang": "en"}
-        for attempt in range(2):
-            async with _photon_slots:  # the public server 503s on bursts
-                resp = await client.get(PHOTON_URL, params=params, timeout=6.0)
-            if resp.status_code not in (429, 503) or attempt:
-                break
-            await asyncio.sleep(0.7)
-        resp.raise_for_status()
+        key = (text, tag, bbox)
+        cached = _photon_cache.get(key)
+        if cached and time.monotonic() - cached[0] < PHOTON_CACHE_S:
+            features = cached[1]
+        else:
+            for attempt in range(2):
+                async with _photon_slots:  # the public server 503s on bursts
+                    resp = await client.get(PHOTON_URL, params=params, timeout=5.0)
+                if resp.status_code not in (429, 503) or attempt:
+                    break
+                await asyncio.sleep(0.6)
+            resp.raise_for_status()
+            features = resp.json().get("features", [])
+            _photon_cache[key] = (time.monotonic(), features)
         out = []
-        for f in resp.json().get("features", []):
+        for f in features:
             props, coords = f.get("properties", {}), f.get("geometry", {}).get("coordinates")
             name = props.get("name")
             if not name or not coords:
@@ -250,6 +261,7 @@ def _from_osm(el: dict, center: Location, country_code: str) -> Place | None:
 def _score(p: Place, vegetarian: bool) -> float:
     score = -p.distance_km
     score += 0.6 * bool(p.opening_hours) + 0.4 * bool(p.website) + 0.3 * bool(p.cuisine)
+    score += 2.0 * (p.source == "curated")  # well-known places with known hours and prices make plans feel real
     if vegetarian and p.veg:
         score += {"only": 3, "yes": 2, "unverified": 0, "no": -99}[p.veg]
     return score
@@ -290,7 +302,7 @@ def _filter(places: list[Place], indoor_only: bool, vegetarian: bool, max_price:
     return out
 
 
-def curated_places(city: str, center: Location, kind: str, categories: list[str]) -> list[Place]:
+def curated_places(city: str, center: Location, kind: str, categories: list[str], strict: bool = False) -> list[Place]:
     rows = curated_for(city) or []
     places = []
     for name, category, lat, lon, extra in rows:
@@ -315,7 +327,7 @@ def curated_places(city: str, center: Location, kind: str, categories: list[str]
             note=extra.get("note"),
         ))
     wanted = [p for p in places if p.category in categories]
-    return wanted or places
+    return wanted if (wanted or strict) else places
 
 
 def generic_places(center: Location, kind: str, country_code: str) -> list[Place]:
@@ -349,32 +361,58 @@ async def find_places(
     max_price: float | None = None,
     limit: int = 12,
 ) -> tuple[list[Place], str, list[str]]:
-    """Returns (places, source, notes). source is 'live', 'fallback' or 'generic'."""
+    """Returns (places, source, notes). source is 'live' (some live results), 'curated' or 'generic'."""
     notes: list[str] = []
     categories = [c for c in categories if c in SELECTORS] or (["park", "museum", "bookstore"] if kind == "activity" else ["cafe", "restaurant"])
     radius_km = max(0.5, min(radius_km, 12))
+
+    # Curated first: well-known places with hours, prices and veg status, near the search point.
+    curated = _filter(curated_places(city, center, kind, categories, strict=True), indoor_only, vegetarian, max_price)
+    curated = [p for p in curated if p.distance_km <= max(radius_km * 1.6, 6)]  # stay in the user's part of town
+
+    global _photon_down_until
+    live: list[Place] = []
+    live_budget = 3.0 if len(curated) >= 5 else 8.0  # curated data already covers this area: don't wait long for live
     try:
-        raw, provider = await _live(categories, center, radius_km, country_code, vegetarian)
-        places = _filter(raw, indoor_only, vegetarian, max_price)
-        if len(places) < 3 and radius_km < 12:
+        if time.monotonic() < _photon_down_until and curated:
+            raise PlacesUnavailable("Live map search is struggling right now; using curated places.")
+        try:
+            raw, provider = await asyncio.wait_for(_live(categories, center, radius_km, country_code, vegetarian), timeout=live_budget)
+        except asyncio.TimeoutError:
+            _photon_down_until = time.monotonic() + PHOTON_COOLDOWN
+            raise PlacesUnavailable(f"Live search took over {live_budget:g}s; using what's on hand.")
+        live = _filter(raw, indoor_only, vegetarian, max_price)
+        if len(live) + len(curated) < 4 and radius_km < 12:
             wider = min(12, radius_km * 2)
-            notes.append(f"Only {len(places)} matches within {radius_km:g} km, widened search to {wider:g} km.")
-            raw, provider = await _live(categories, center, wider, country_code, vegetarian)
-            places = _filter(raw, indoor_only, vegetarian, max_price)
-        if places:
+            notes.append(f"Only {len(live) + len(curated)} matches within {radius_km:g} km, widened the search to {wider:g} km.")
+            try:
+                raw, provider = await asyncio.wait_for(_live(categories, center, wider, country_code, vegetarian), timeout=live_budget)
+                live = _filter(raw, indoor_only, vegetarian, max_price)
+            except asyncio.TimeoutError:
+                pass
+        if live:
             notes.append(f"Live data from {provider}.")
-            return _diverse_top(places, limit, vegetarian), "live", notes
-        notes.append("No live OpenStreetMap matches for these filters.")
     except PlacesUnavailable as err:
+        if "Photon" in str(err):
+            _photon_down_until = time.monotonic() + PHOTON_COOLDOWN
         notes.append(str(err))
 
-    curated = _filter(curated_places(city, center, kind, categories), indoor_only, vegetarian, max_price)
-    nearby = [p for p in curated if p.distance_km <= max(radius_km * 3, 6)]
-    if curated and not nearby:
-        nearby = sorted(curated, key=lambda p: p.distance_km)[:3]
-        notes.append(f"Nearest curated options are {nearby[0].distance_km:.0f}+ km away.")
-    if nearby:
-        notes.append("Using curated fallback places for this city.")
-        return _diverse_top(nearby, limit, vegetarian), "fallback", notes
-    notes.append("No curated data for this city either; returning generic suggestions.")
-    return generic_places(center, kind, country_code), "generic", notes
+    curated_names = {_norm(p.name) for p in curated}
+    live = [p for p in live if _norm(p.name) not in curated_names and not any(_norm(p.name) in c or c in _norm(p.name) for c in curated_names)]
+    merged = curated + live
+    if not merged:  # nothing in the categories asked for: any curated place of this kind, then generic
+        merged = sorted(_filter(curated_places(city, center, kind, categories), indoor_only, vegetarian, max_price), key=lambda p: p.distance_km)[:6]
+        if merged:
+            notes.append(f"No matches for these categories; showing other curated options (nearest {merged[0].distance_km:.0f} km).")
+    if not merged:
+        notes.append("No live or curated data here; returning generic suggestions.")
+        return generic_places(center, kind, country_code), "generic", notes
+
+    picked = _diverse_top(merged, limit, vegetarian)
+    n_cur = sum(p.source == "curated" for p in picked)
+    notes.insert(0, f"{n_cur} curated, {len(picked) - n_cur} live OpenStreetMap")
+    return picked, ("live" if n_cur < len(picked) else "curated"), notes
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()

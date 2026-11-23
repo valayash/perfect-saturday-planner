@@ -14,7 +14,7 @@ from google.genai import types
 from openai import AsyncOpenAI
 
 from .fallback_data import CITY_KEYS
-from .gateway import GATEWAY_MODELS, error_text, is_account_problem
+from .gateway import PARSE_MODELS, error_text, is_account_problem, request_options
 from .models import PlanRequest, Preferences
 from .prompts import PARSE_SYSTEM
 
@@ -121,6 +121,26 @@ def heuristic_preferences(req: PlanRequest) -> Preferences:
     )
 
 
+def coerce_preferences(text: str, req: PlanRequest) -> Preferences:
+    """Lay the model's JSON over the rule-based reading of the same request, so a small model that skips
+    or renames a field (e.g. "available_time": "4 hours") still yields complete preferences."""
+    data = json.loads(text[text.find("{"): text.rfind("}") + 1])
+    if not isinstance(data, dict):
+        raise ValueError("model output is not a JSON object")
+    if "available_minutes" not in data and data.get("available_time"):
+        data["available_minutes"] = _minutes(str(data["available_time"]))
+    base = heuristic_preferences(req).model_dump()
+    merged = {**base, **{k: v for k, v in data.items() if k in Preferences.model_fields and v not in (None, "")}}
+    interests = {str(i).lower() for i in merged.get("interests") or []}
+    for key in ("hard_constraints", "soft_constraints"):  # small models sometimes copy interests in here
+        merged[key] = [c for c in merged.get(key) or [] if str(c).lower() not in interests]
+    if merged.get("city") and "needs_clarification" not in data:
+        merged["needs_clarification"], merged["clarifying_questions"] = False, []
+    if merged.get("country_code") == "IN" and merged.get("currency") in (None, "", "local"):
+        merged["currency"] = "INR"
+    return Preferences.model_validate(merged)
+
+
 def _request_text(req: PlanRequest) -> str:
     fields = req.model_dump(exclude={"free_text", "clarifications", "run_id"}, exclude_none=True)
     fields = {k: v for k, v in fields.items() if v not in ([], "")}
@@ -137,8 +157,8 @@ PARSE_MODEL = os.getenv("GEMINI_PARSE_MODEL", "gemini-3.5-flash-lite")
 PARSE_BUDGET_S = 20
 
 
-async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: float) -> Preferences | None:
-    for model in GATEWAY_MODELS:
+async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: float, meta: dict) -> Preferences | None:
+    for model in PARSE_MODELS:
         remaining = deadline - time.monotonic()
         if remaining < 3:
             return None
@@ -149,10 +169,13 @@ async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: 
                     messages=[{"role": "system", "content": PARSE_SYSTEM}, {"role": "user", "content": _request_text(req)}],
                     response_format={"type": "json_schema", "json_schema": {"name": "preferences", "schema": Preferences.model_json_schema()}},
                     max_tokens=4000,
+                    **request_options(model),
                 ),
-                timeout=min(remaining, 12),
+                timeout=min(remaining, 10),
             )
-            return Preferences.model_validate_json(resp.choices[0].message.content or "")
+            prefs = coerce_preferences(resp.choices[0].message.content or "", req)
+            meta.update(model=model, tokens=getattr(resp.usage, "total_tokens", 0) or 0)
+            return prefs
         except Exception as err:
             log.warning("parse_preferences failed on gateway %s: %s", model, error_text(err))
             if is_account_problem(err):  # e.g. no card on file: no gateway model will work
@@ -160,13 +183,16 @@ async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: 
     return None
 
 
-async def parse_preferences(client: genai.Client | None, req: PlanRequest, gateway: AsyncOpenAI | None = None) -> tuple[Preferences, str]:
-    """Returns (preferences, source) where source is 'gateway', 'gemini' or 'rules'."""
+async def parse_preferences(
+    client: genai.Client | None, req: PlanRequest, gateway: AsyncOpenAI | None = None, meta: dict | None = None
+) -> tuple[Preferences, str]:
+    """Returns (preferences, source) where source is 'gateway', 'gemini' or 'rules'. Fills meta with model and tokens."""
+    meta = meta if meta is not None else {}
     fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
     prefs, source = None, "rules"
     deadline = time.monotonic() + PARSE_BUDGET_S  # an overloaded model should cost seconds, not a minute
     if gateway:
-        prefs = await _parse_with_gateway(gateway, req, deadline)
+        prefs = await _parse_with_gateway(gateway, req, deadline, meta)
         source = "gateway" if prefs else "rules"
     models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client and not prefs else {}  # fast model first, then the chain
     for model in models:
@@ -189,6 +215,7 @@ async def parse_preferences(client: genai.Client | None, req: PlanRequest, gatew
                 timeout=min(remaining, 12),
             )
             prefs, source = Preferences.model_validate_json(response.text or ""), "gemini"
+            meta.update(model=model, tokens=getattr(response.usage_metadata, "total_token_count", 0) or 0)
             break
         except Exception as err:  # overloaded, timed out, bad key, malformed JSON...: try the next model, then rules
             log.warning("parse_preferences failed on %s: %s", model, (str(err) or type(err).__name__)[:200])

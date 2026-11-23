@@ -14,7 +14,12 @@ Browser (Next.js) ──POST /api/plan──▶ FastAPI (Python) ──▶ LLM t
 
 1. **`parse_preferences`**: an LLM (structured JSON output) turns the form or free text into typed preferences: minutes, energy level, hard vs soft constraints. If the input is too vague (no city, "plan something fun"), it asks 1–2 clarifying questions instead of guessing.
 2. **`resolve_location`**: geocodes the city and neighbourhood (Open-Meteo).
-3. **Agent loop**: the model decides which tools to call (usually weather + activities + food in parallel), drafts a plan, validates it, fixes errors and submits:
+3. **Gather (code, in parallel)**: Saturday's forecast plus activity and food candidates near the user's area: well-known curated places first (with hours, prices and veg status), topped up with live OpenStreetMap results.
+4. **Plan + revise (LLM agent)**: the model gets the candidates and calls `submit_plan`. The server fixes timing slips itself (moves stops later to fit real travel time, rounds to 5 min), validates the rest and sends back anything the model must fix. Typically 2 LLM calls in total (~6K tokens, ~10–20 s), with `gpt-oss` served by Cerebras/Groq through Vercel AI Gateway.
+
+Plans include the ride from the user's area to the first stop and back home ("home around 19:04"), a 5% budget buffer, crowd level at that hour, the rain window, a plain-language "Worth knowing" list, the parser's assumptions and a Google Maps route.
+
+Tools:
 
 | Tool | What it does | Data |
 |---|---|---|

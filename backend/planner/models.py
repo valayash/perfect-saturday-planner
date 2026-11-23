@@ -85,6 +85,7 @@ class Place(BaseModel):
             "place_id": self.id,
             "name": self.name,
             "category": self.category,
+            "source": self.source,
             "distance_km": round(self.distance_km, 1),
             "indoor": self.indoor,
             "est_cost_per_person": round(self.est_cost),

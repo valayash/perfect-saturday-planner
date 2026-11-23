@@ -11,7 +11,9 @@ const ICONS: Record<string, string> = {
   find_food: "🍽️",
   estimate_cost: "💰",
   validate_plan: "🔎",
-  submit_plan: "📝",
+  submit_plan: "🧾",
+  plan_with_llm: "✍️",
+  revise_plan: "🔁",
 };
 
 const SOURCE_STYLE: Record<string, string> = {
@@ -19,6 +21,7 @@ const SOURCE_STYLE: Record<string, string> = {
   gemini: "bg-accent-soft text-accent",
   gateway: "bg-accent-soft text-accent",
   fallback: "bg-warn-soft text-warn",
+  curated: "bg-ink text-bg",
   generic: "bg-warn-soft text-warn",
   rules: "bg-warn-soft text-warn",
   unavailable: "bg-err-soft text-err",
@@ -38,6 +41,11 @@ function Step({ item }: { item: StepItem }) {
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-1.5">
             <span className="text-sm font-medium text-ink">{item.label}</span>
+            {item.actor && (
+              <span className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold ${item.actor === "llm" ? "bg-ink text-bg" : "bg-surface-2 text-muted"}`}>
+                {item.actor === "llm" ? "LLM" : "CODE"}
+              </span>
+            )}
             <code className="font-mono text-[11px] text-muted">{item.name}</code>
             <Badge source={item.source} />
           </span>
@@ -97,11 +105,13 @@ export default function TracePanel({
   running,
   startedAt,
   doneSeconds,
+  llmStats,
 }: {
   items: TraceItem[];
   running: boolean;
   startedAt: number | null;
   doneSeconds: number | null;
+  llmStats?: { calls: number; tokens: number } | null;
 }) {
   const [now, setNow] = useState(() => Date.now());
   const [collapsed, setCollapsed] = useState(false);
@@ -124,7 +134,8 @@ export default function TracePanel({
         </h2>
         <span className="text-xs text-muted">
           {tools.length} step{tools.length === 1 ? "" : "s"}
-          {elapsed != null ? ` · ${elapsed.toFixed(1)}s` : ""} · {collapsed ? "show" : "hide"}
+          {elapsed != null ? ` · ${elapsed.toFixed(1)}s` : ""}
+          {llmStats ? ` · ${llmStats.calls} LLM call${llmStats.calls === 1 ? "" : "s"} · ${llmStats.tokens.toLocaleString()} tokens` : ""} · {collapsed ? "show" : "hide"}
         </span>
       </button>
       {!collapsed && (

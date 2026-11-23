@@ -107,15 +107,18 @@ sequenceDiagram
 
 ## 4. The agent
 
-### 4.1 Three phases
+### 4.1 Four phases
 
 | Phase | What happens | LLM? |
 |---|---|---|
 | 1. `parse_preferences` | Normalise the input into a typed `Preferences` object: city, area, budget, currency, minutes, start time, mood, **energy level**, interests, **hard vs soft constraints**, assumptions. Decides whether to ask clarifying questions. | Gemini structured output, with a rule-based fallback |
 | 2. `resolve_location` | Geocode the city (the most populous match) and neighbourhood (the match nearest the city). An unknown city becomes a clarifying question. | No |
-| 3. Tool loop | Gemini plans with the six tools below until `submit_plan` is accepted. | Gemini function calling |
+| 3. Gather | Weather, activity candidates and food candidates, fetched **by code in parallel** (curated-first, topped up with live OSM). | No |
+| 4. Plan + revise | The model plans from the gathered candidates and calls `submit_plan` directly; the server repairs timing, validates, and returns real problems for one revision. It can still call the search tools for genuine gaps (max 2 searches). | AI Gateway (`gpt-oss-120b` on Cerebras/Groq), then Gemini |
 
 Parsing is a separate, cheap call on purpose. It keeps clarification logic out of the planning loop, and the loop always starts from clean, validated preferences.
+
+**Why gather in code first:** the first version let the model decide every lookup, which took 4–6 LLM calls and ~25–30K tokens per plan (30–40 s). Fetching the data every plan needs in code, then letting the model plan and fix, brings it to about 2 LLM calls and ~6K tokens. The parse step uses the small `gpt-oss-20b`; its JSON is laid over a rule-based reading of the same request, so a skipped or renamed field never breaks a run. Timing slips (not enough travel time, odd minutes) are repaired by the server (`snap_schedule`) instead of costing another model call, and rejections include the travel-adjusted schedule so one revision is usually enough.
 
 ### 4.2 Tools
 
@@ -193,7 +196,9 @@ All of it is configurable with `GEMINI_MODELS` and `GEMINI_PARSE_MODEL`.
 | Check | Error (must fix) | Warning (fix or explain) |
 |---|---|---|
 | Grounding | `place_id` not returned by a search | |
-| Time window | starts > 15 min before the user is free; ends > 15 min after the cutoff | uses < 50% of available time |
+| Time window | starts > 15 min before the user is free; ends > 15 min after the cutoff; uses < 40% of the time | uses < 60% of the time |
+| Getting there | first stop starts > 20 min before the user could arrive from their area | first stop slightly early |
+| Realistic stops | a café or meal longer than 2 hours | |
 | Travel feasibility | gap between stops < travel time − 10 min; any leg > 15 km | leg > 8 km; travel > 30% of the plan |
 | Budget | total > 115% of budget | total > 100% of budget |
 | Opening hours (OSM `opening_hours`, Saturday) | parsed hours show the place is closed | hours unknown for live places |
@@ -211,6 +216,9 @@ Costs come from `estimate_cost`: per-category price heuristics (INR for India, a
 ## 7. Data layer
 
 ### 7.1 Places provider chain
+
+**Curated first.** For Bengaluru, Mumbai and Delhi, well-known places with hours, per-person prices and veg status are merged in first (within ~1.6× the search radius), then live OSM results fill the rest. Popular neighbourhoods resolve through built-in anchors (e.g. "Bandra" means Bandra West). Live search gets ~3 s when curated data already covers the area (8 s otherwise), Photon results are cached for 30 min, and after a Photon failure live search is skipped for 5 min.
+
 
 ```mermaid
 flowchart TD

@@ -1,7 +1,11 @@
-"""The agent loop. Yields trace events (dicts) that the API streams to the browser as SSE.
+"""The planner. Yields trace events (dicts) that the API streams to the browser as SSE.
 
-Provider chain: Vercel AI Gateway (several models) -> Gemini API (several models) -> rule-based planner.
-Each stage hands the work gathered so far to the next, so nothing is fetched twice.
+Workflow:
+  1. parse_preferences   (LLM: small fast model)      -> typed preferences, or clarifying questions
+  2. resolve_location    (code)                       -> city / neighbourhood coordinates
+  3. gather data         (code, in parallel)          -> weather, activity candidates, food candidates
+  4. plan + revise       (LLM agent with tools)       -> submit_plan, re-validated by the server
+Provider chain for step 4: Vercel AI Gateway models -> Gemini API models -> rule-based planner.
 """
 
 from __future__ import annotations
@@ -18,8 +22,8 @@ from google.genai import errors, types
 from openai import AsyncOpenAI
 
 from .checks import RunContext, StopIn, to_hhmm, to_min, validate_plan
-from .gateway import GATEWAY_MODELS, OPENAI_TOOLS, error_text, gateway_client, is_account_problem, is_busy
-from .geo import GeocodeError, haversine_km, resolve_location
+from .gateway import GATEWAY_MODELS, OPENAI_TOOLS, error_text, gateway_client, is_account_problem, is_busy, request_options
+from .geo import ALIASES, GeocodeError, haversine_km, resolve_location, travel_leg
 from .models import PlanRequest
 from .parse import parse_preferences
 from .prompts import AGENT_SYSTEM
@@ -27,13 +31,13 @@ from .tools import TOOL_SPECS, FinalStop, PlanB, SubmitIn, build_final_plan, run
 
 # Gemini models, tried in order; the run switches to the next one if a model is overloaded.
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
-MID_RUN_RETRIES = 2  # then hand off to the next model with a summary (Gemini history is tied to one model's thought signatures)
+MID_RUN_RETRIES = 2  # then hand off to the next model (Gemini history is tied to one model's thought signatures)
 THINKING_LEVEL = {"gemini-4-hydrogen": "medium", "gemini-4-neon": "medium"}  # others: "low"
-MAX_TURNS = 10
+MAX_TURNS = 8
 DEADLINE_S = 240  # Vercel Hobby functions stop at 300s
 TURN_TIMEOUT_MS = 20_000
-GATEWAY_TURN_TIMEOUT_S = 45  # reasoning models on long turns need more than the Gemini fail-fast budget
-NUDGE = "Please continue: validate your plan and finish by calling submit_plan."
+GATEWAY_TURN_TIMEOUT_S = 45
+NUDGE = "Please finish now by calling submit_plan with your plan."
 
 GEMINI_TOOLS = types.Tool(function_declarations=[
     types.FunctionDeclaration(name=t["name"], description=t["description"], parameters_json_schema=t["parameters"])
@@ -46,7 +50,7 @@ LABELS = {
     "find_food": "Finding food that fits",
     "estimate_cost": "Estimating cost",
     "validate_plan": "Checking the plan is realistic",
-    "submit_plan": "Submitting the final plan",
+    "submit_plan": "Final check by the server",
 }
 
 
@@ -64,7 +68,9 @@ class LoopState:
     final_plan: dict | None = None
     model: str | None = None
     failure: str = ""
-    attempt: int = 0
+    llm_calls: int = 0
+    tokens: int = 0
+    model_searches: int = 0
     results: list = field(default_factory=list)
 
     def out_of_time(self) -> bool:
@@ -79,10 +85,10 @@ class _Steps:
     def __init__(self) -> None:
         self.n = 0
 
-    def start(self, name: str, label: str, input_: object = None) -> tuple[dict, str, float]:
+    def start(self, name: str, label: str, input_: object = None, actor: str = "code") -> tuple[dict, str, float]:
         self.n += 1
         sid = f"s{self.n}"
-        return _ev("step_start", id=sid, name=name, label=label, input=input_), sid, time.monotonic()
+        return _ev("step_start", id=sid, name=name, label=label, input=input_, actor=actor), sid, time.monotonic()
 
     @staticmethod
     def end(sid: str, t0: float, summary: str, ok: bool = True, source: str | None = None, output: object = None) -> dict:
@@ -92,7 +98,7 @@ class _Steps:
 def _user_message(ctx: RunContext) -> str:
     p = ctx.prefs
     end = to_hhmm(to_min(p.start_time) + p.available_minutes)
-    where = ctx.city.label + (f", around {ctx.center.name}" if ctx.center is not ctx.city else "")
+    where = ctx.city.label + (f", starting from {ctx.center.name}" if ctx.center is not ctx.city else "")
     prefs = p.model_dump(exclude={"needs_clarification", "clarifying_questions"})
     return (
         f"Plan this Saturday in {where}.\n"
@@ -102,40 +108,47 @@ def _user_message(ctx: RunContext) -> str:
     )
 
 
-def _handoff_message(ctx: RunContext, last_draft: dict | None) -> str:
-    """Seed a different model with everything gathered so far (place_ids stay valid: they live in ctx.places)."""
-    work = {
-        "weather": ctx.weather,
-        "places_found": [p.brief() for p in list(ctx.places.values())[:40]],
-        "last_draft": last_draft,
+def _seed_message(ctx: RunContext, last_draft: dict | None) -> str:
+    """Everything gathered so far, so the model can plan straight away (place_ids live in ctx.places)."""
+    weather = {k: v for k, v in (ctx.weather or {}).items() if k != "hourly"} | {"hourly": (ctx.weather or {}).get("hourly", [])}
+    def brief(p):
+        leg = travel_leg(ctx.center.lat, ctx.center.lon, p.lat, p.lon, ctx.city.country_code)
+        return p.brief() | {"minutes_from_start": leg["minutes"]}
+
+    data = {
+        "weather": weather if ctx.weather else "unavailable: plan for uncertain weather",
+        "activity_candidates": [brief(p) for p in ctx.places.values() if p.kind == "activity"][:20],
+        "food_candidates": [brief(p) for p in ctx.places.values() if p.kind == "food"][:16],
+        "travel_rule_of_thumb": "between two stops allow ~6 min plus ~3-4 min per km by auto/cab; walking under ~1 km",
     }
+    if last_draft:
+        data["previous_draft"] = last_draft
     return (
         _user_message(ctx)
-        + "\n\nAnother planner already gathered the data below before it became unavailable. Use these place_ids "
-        "(you may call tools again if you need more), then validate the plan and finish by calling submit_plan.\n"
-        + json.dumps(work, ensure_ascii=False)
+        + "\n\nThe forecast and candidate places are already gathered below (distance_km is from the user's starting area). "
+        "Plan from these place_ids and call submit_plan directly; the server validates it and tells you anything to fix.\n"
+        + json.dumps(data, ensure_ascii=False)
     )
 
 
-def _first_message(ctx: RunContext, state: LoopState) -> str:
-    return _handoff_message(ctx, state.last_draft) if ctx.places else _user_message(ctx)
+MAX_MODEL_SEARCHES = 2  # the data is pre-gathered; extra searches are for genuine gaps, not habit
 
 
-def _thinking(state: LoopState, model: str) -> list[dict]:
-    state.attempt += 1
-    block = f"a{state.attempt}-0"
-    return [_ev("thought_start", block=block, kind="status"), _ev("thought_delta", block=block, text=f"Thinking with {model}…")]
-
-
-async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: list[tuple[str | None, str, dict]]) -> AsyncIterator[dict]:
-    """Run one turn's tool calls concurrently, streaming start/end events. Results land in state.results."""
-    starts = []
+async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: list[tuple[str | None, str, dict]], actor: str = "code",
+                     from_model: bool = False) -> AsyncIterator[dict]:
+    """Run tool calls concurrently, streaming start/end events. Results land in state.results."""
+    starts, refused = [], []
     for call_id, name, args in calls:
-        ev, sid, t0 = steps.start(name, LABELS.get(name, name), args)
+        if from_model and name in ("find_activities", "find_food"):
+            state.model_searches += 1
+            if state.model_searches > MAX_MODEL_SEARCHES:
+                refused.append((call_id, name, {"error": "You already have enough candidates. Plan from them and call submit_plan now."}))
+                continue
+        ev, sid, t0 = steps.start(name, LABELS.get(name, name), args, actor=actor)
         starts.append((call_id, name, args, sid, t0))
         yield ev
     outcomes = await asyncio.gather(*(run_tool(ctx, name, args, state.submit_attempts) for _, name, args, _, _ in starts))
-    state.results = []
+    state.results = list(refused)
     for (call_id, name, args, sid, t0), out in zip(starts, outcomes):
         yield steps.end(sid, t0, out.summary, ok=not out.is_error, source=out.source, output=out.result)
         state.results.append((call_id, name, {"error": out.result} if out.is_error else out.result))
@@ -146,30 +159,55 @@ async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: li
             state.final_plan = out.final_plan or state.final_plan
 
 
+def _gather_calls(ctx: RunContext) -> list[tuple[None, str, dict]]:
+    """The data every plan needs, fetched by code in parallel before the model is involved."""
+    p = ctx.prefs
+    interest_cats = _categories_for(p.interests, rainy=False)
+    indoor = ["arts_centre", "gallery", "museum", "bookstore", "live_music"]
+    activity_cats = (interest_cats + [c for c in indoor if c not in interest_cats])[:6]
+    food_cats = ["cafe", "restaurant"] + (["dessert"] if any("dessert" in i or "sweet" in i for i in p.interests) else [])
+    return [
+        (None, "get_weather", {}),
+        (None, "find_activities", {"categories": activity_cats, "radius_km": 5}),
+        (None, "find_food", {"categories": food_cats, "radius_km": 3.5, "max_price_per_person": round(p.budget * 0.6)}),
+    ]
+
+
 async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[dict]:
     started = time.monotonic()
     steps = _Steps()
+    state = LoopState(started=started)
     gateway = gateway_client(oidc_token)
     try:
         gemini: genai.Client | None = genai.Client()  # reads GEMINI_API_KEY
     except Exception:  # no API key configured
         gemini = None
 
-    # 1. understand preferences
-    ev, sid, t0 = steps.start("parse_preferences", "Understanding your preferences", req.model_dump(exclude={"run_id"}, exclude_none=True, exclude_defaults=True))
+    # 1. understand preferences (LLM)
+    ev, sid, t0 = steps.start("parse_preferences", "Understanding your request", req.model_dump(exclude={"run_id"}, exclude_none=True, exclude_defaults=True), actor="llm")
     yield ev
-    prefs, parse_source = await parse_preferences(gemini, req, gateway)
-    yield steps.end(sid, t0, f"{prefs.city or 'no city'} · {prefs.available_minutes} min · {prefs.energy} energy" + (" (rule-based: AI unavailable)" if parse_source == "rules" else ""), source=parse_source, output=prefs.model_dump())
+    meta: dict = {}
+    # Geocode the city from the form while the model reads the request; reused if the parse agrees on the city.
+    early_geo = asyncio.create_task(resolve_location(req.city, req.area, None)) if req.city else None
+    prefs, parse_source = await parse_preferences(gemini, req, gateway, meta)
+    if meta.get("model"):
+        state.llm_calls += 1
+        state.tokens += meta.get("tokens", 0)
+    who = f"{meta['model']} extracted preferences" if meta.get("model") else "rule-based parse (AI unavailable)"
+    yield steps.end(sid, t0, f"{who}: {prefs.city or 'no city'} · {prefs.start_time}, {prefs.available_minutes} min · {round(prefs.budget)} {prefs.currency} · {prefs.energy} energy", source=parse_source, output=prefs.model_dump())
     yield _ev("preferences", preferences=prefs.model_dump(), source=parse_source)
     if prefs.needs_clarification:
         yield _ev("clarify", questions=prefs.clarifying_questions, assumptions=prefs.assumptions)
         return
 
-    # 2. resolve the city / neighbourhood
-    ev, sid, t0 = steps.start("resolve_location", "Finding your city on the map", {"city": prefs.city, "area": prefs.area})
+    # 2. resolve the city / neighbourhood (code)
+    ev, sid, t0 = steps.start("resolve_location", "Finding your area on the map", {"city": prefs.city, "area": prefs.area})
     yield ev
+    same_place = early_geo and (prefs.area or "") == (req.area or "") and _same_city(prefs.city, req.city)
+    if early_geo and not same_place:
+        early_geo.cancel()
     try:
-        city, area = await resolve_location(prefs.city or "", prefs.area, prefs.country_code)
+        city, area = await (early_geo if same_place else resolve_location(prefs.city or "", prefs.area, prefs.country_code))
     except GeocodeError as err:
         yield steps.end(sid, t0, str(err), ok=False)
         yield _ev("clarify", questions=[f"I couldn't find '{prefs.city}'. Which city (and country) do you mean?"], assumptions=[])
@@ -178,16 +216,17 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         yield steps.end(sid, t0, f"Geocoding failed ({type(err).__name__})", ok=False)
         yield _ev("error", message="Couldn't reach the map service. Please try again in a moment.", retryable=True)
         return
-    note = f"{city.label}" + (f" · around {area.name}" if area else (f" · '{prefs.area}' not found, using city centre" if prefs.area else ""))
+    note = f"{city.label}" + (f" · starting from {area.name}" if area else (f" · '{prefs.area}' not found, using the city centre" if prefs.area else ""))
     yield steps.end(sid, t0, note, source="live", output={"city": city.model_dump(), "area": area.model_dump() if area else None})
     if prefs.currency in ("local", "") and city.country_code == "IN":
         prefs.currency = "INR"
-
     ctx = RunContext(prefs=prefs, city=city, center=area or city)
-    state = LoopState(started=started)
 
-    # 3. agent loop: AI Gateway, then Gemini, then rules
-    # (Even if parsing fell back to rules, the agent may still work: a parse failure can be one model's JSON quirk.)
+    # 3. gather weather and candidates (code, in parallel)
+    async for e in _run_calls(ctx, steps, state, _gather_calls(ctx)):
+        yield e
+
+    # 4. plan + revise (LLM agent): AI Gateway, then Gemini, then rules
     stages = []
     if gateway:
         stages.append(_gateway_loop(gateway, ctx, steps, state))
@@ -197,8 +236,10 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         async for e in stage:
             yield e
         if state.final_plan:
+            seconds = round(time.monotonic() - started, 1)
+            state.final_plan["stats"] = {"llm_calls": state.llm_calls, "tokens": state.tokens, "seconds": seconds}
             yield _ev("plan", plan=state.final_plan, mode="agent", model=state.model)
-            yield _ev("done", seconds=round(time.monotonic() - started, 1))
+            yield _ev("done", seconds=seconds, llm_calls=state.llm_calls, tokens=state.tokens)
             return
         if state.out_of_time():
             break
@@ -207,47 +248,65 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         yield e
 
 
+def _same_city(a: str | None, b: str | None) -> bool:
+    norm = lambda x: ALIASES.get((x or "").strip().lower(), (x or "").strip()).lower()  # noqa: E731
+    return bool(a and b) and norm(a) == norm(b)
+
+
+def _llm_step_label(turn: int, state: LoopState) -> tuple[str, str]:
+    if turn == 0:
+        return "plan_with_llm", "Writing the plan"
+    if state.last_draft and state.last_draft.get("tool") == "submit_plan":
+        return "revise_plan", "Revising after the server's check"
+    return "plan_with_llm", "Continuing the plan"
+
+
 async def _gateway_loop(client: AsyncOpenAI, ctx: RunContext, steps: _Steps, state: LoopState) -> AsyncIterator[dict]:
     """OpenAI-format tool loop through Vercel AI Gateway. Plain-JSON history, so switching models mid-run is safe."""
-    messages: list[dict] = [{"role": "system", "content": AGENT_SYSTEM}, {"role": "user", "content": _first_message(ctx, state)}]
+    messages: list[dict] = [{"role": "system", "content": AGENT_SYSTEM}, {"role": "user", "content": _seed_message(ctx, state.last_draft)}]
     model_idx, retries, turns = 0, 0, 0
-    yield _ev("status", message=f"Agent model: {GATEWAY_MODELS[0]} via Vercel AI Gateway", tone="info")
     while turns < MAX_TURNS and not state.out_of_time():
         model = GATEWAY_MODELS[model_idx]
-        for e in _thinking(state, model):
-            yield e
+        name, label = _llm_step_label(turns, state)
+        ev, sid, t0 = steps.start(name, label, {"model": model, "via": "Vercel AI Gateway"}, actor="llm")
+        yield ev
         try:
-            extra = {"reasoning_effort": "low"} if model.startswith("openai/gpt-oss") else {}  # faster turns, the validator checks the work
             resp = await client.chat.completions.create(
-                model=model, messages=messages, tools=OPENAI_TOOLS, max_tokens=8000, timeout=GATEWAY_TURN_TIMEOUT_S, **extra
+                model=model, messages=messages, tools=OPENAI_TOOLS, max_tokens=8000, timeout=GATEWAY_TURN_TIMEOUT_S, **request_options(model)
             )
         except Exception as err:
+            yield steps.end(sid, t0, f"{model}: {error_text(err)}", ok=False, source="gateway")
             if is_account_problem(err):
                 state.failure = f"Vercel AI Gateway refused the request ({error_text(err)})"
                 yield _ev("status", message=f"{state.failure}. Trying the Gemini API instead.")
                 return
             if is_busy(err) and retries < 1:
                 retries += 1
-                yield _ev("status", message=f"{model} is busy ({error_text(err)}). Retrying…", tone="info")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
                 continue
             if model_idx + 1 < len(GATEWAY_MODELS):  # JSON history works with any model: just switch
                 model_idx, retries = model_idx + 1, 0
-                yield _ev("status", message=f"{model} failed ({error_text(err)}). Switching to {GATEWAY_MODELS[model_idx]}.")
+                yield _ev("status", message=f"{model} failed ({error_text(err)}). Switching to {GATEWAY_MODELS[model_idx]}.", tone="info")
                 continue
             state.failure = f"Every AI Gateway model failed ({error_text(err)})"
             yield _ev("status", message=f"{state.failure}. Trying the Gemini API instead.")
             return
         retries, turns = 0, turns + 1
+        state.llm_calls += 1
+        tokens = getattr(resp.usage, "total_tokens", 0) or 0
+        state.tokens += tokens
         choice = resp.choices[0]
         msg = choice.message
+        tool_calls = msg.tool_calls or []
+        names = [tc.function.name for tc in tool_calls]
+        yield steps.end(sid, t0, f"{model} · {tokens:,} tokens" + (f" → {', '.join(names)}" if names else " → no tool call"), source="gateway",
+                        output={"model": model, "tokens": tokens, "tool_calls": names, "finish_reason": choice.finish_reason})
         reasoning = (msg.model_extra or {}).get("reasoning")
         for kind, text in (("thought", reasoning), ("text", msg.content)):
             if isinstance(text, str) and text.strip():
-                block = f"a{state.attempt}-{kind}"
+                block = f"{sid}-{kind}"
                 yield _ev("thought_start", block=block, kind=kind)
                 yield _ev("thought_delta", block=block, text=text.strip())
-        tool_calls = msg.tool_calls or []
         if choice.finish_reason == "content_filter":
             state.failure = f"{model} declined the request"
             return
@@ -265,7 +324,7 @@ async def _gateway_loop(client: AsyncOpenAI, ctx: RunContext, steps: _Steps, sta
             except json.JSONDecodeError:
                 args = {"_invalid_json": tc.function.arguments}
             calls.append((tc.id, tc.function.name, args if isinstance(args, dict) else {}))
-        async for e in _run_calls(ctx, steps, state, calls):
+        async for e in _run_calls(ctx, steps, state, calls, actor="code", from_model=True):
             yield e
         if state.final_plan:
             state.model = model
@@ -278,44 +337,50 @@ async def _gateway_loop(client: AsyncOpenAI, ctx: RunContext, steps: _Steps, sta
 
 async def _gemini_loop(client: genai.Client, ctx: RunContext, steps: _Steps, state: LoopState) -> AsyncIterator[dict]:
     """Gemini function-calling loop (google-genai). Model parts are appended verbatim: they carry thought signatures."""
-    contents: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=_first_message(ctx, state))])]
+    contents: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=_seed_message(ctx, state.last_draft))])]
     model_idx, good_turns, retries, turns = 0, 0, 0, 0
-    yield _ev("status", message=f"Agent model: {MODELS[model_idx]}", tone="info")
     while turns < MAX_TURNS and not state.out_of_time():
+        model = MODELS[model_idx]
+        name, label = _llm_step_label(turns, state)
+        ev, sid, t0 = steps.start(name, label, {"model": model, "via": "Gemini API"}, actor="llm")
+        yield ev
         parts: list[types.Part] | None = None
         finish = None
         try:
-            async for item in _model_turn(client, MODELS[model_idx], contents, state):
+            async for item in _model_turn(client, model, contents, sid):
                 if isinstance(item, dict):
                     yield item
                 else:
                     parts, finish = item
         except ModelBusy as err:
+            yield steps.end(sid, t0, str(err), ok=False, source="gemini")
             if good_turns == 0 and model_idx + 1 < len(MODELS):
                 model_idx += 1
-                yield _ev("status", message=f"{err}. Switching to {MODELS[model_idx]}.")
                 continue
             if retries < MID_RUN_RETRIES:
                 retries += 1
-                yield _ev("status", message=f"{err}. Retrying ({retries}/{MID_RUN_RETRIES})…", tone="info")
                 await asyncio.sleep(1.5 * retries)
                 continue
             if model_idx + 1 < len(MODELS):  # hand off: fresh conversation for the next model, seeded with the work so far
                 model_idx, retries, good_turns = model_idx + 1, 0, 0
-                contents = [types.Content(role="user", parts=[types.Part(text=_handoff_message(ctx, state.last_draft))])]
-                yield _ev("status", message=f"{err}. Handing the work so far to {MODELS[model_idx]}.")
+                contents = [types.Content(role="user", parts=[types.Part(text=_seed_message(ctx, state.last_draft))])]
                 continue
             state.failure = f"The AI model is overloaded ({err})"
             return
         except errors.APIError as err:  # bad key, invalid request...
+            yield steps.end(sid, t0, f"{model}: {err.code} {err.status}", ok=False, source="gemini")
             state.failure = f"The AI model rejected the request ({err.code} {err.status})"
             return
         except Exception as err:
+            yield steps.end(sid, t0, f"{model}: {type(err).__name__}", ok=False, source="gemini")
             state.failure = f"The AI model stopped responding ({type(err).__name__})"
             return
 
         good_turns, turns, retries = good_turns + 1, turns + 1, 0
+        state.llm_calls += 1
         calls = [p.function_call for p in parts if p.function_call]
+        yield steps.end(sid, t0, f"{model}" + (f" → {', '.join(fc.name for fc in calls)}" if calls else " → no tool call"), source="gemini",
+                        output={"model": model, "tool_calls": [fc.name for fc in calls], "finish_reason": finish})
         if finish in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"):
             state.failure = "The model declined this request"
             return
@@ -326,10 +391,10 @@ async def _gemini_loop(client: genai.Client, ctx: RunContext, steps: _Steps, sta
         if not calls:
             contents.append(types.Content(role="user", parts=[types.Part(text=NUDGE)]))
             continue
-        async for e in _run_calls(ctx, steps, state, [(fc.id, fc.name, fc.args or {}) for fc in calls]):
+        async for e in _run_calls(ctx, steps, state, [(fc.id, fc.name, fc.args or {}) for fc in calls], actor="code", from_model=True):
             yield e
         if state.final_plan:
-            state.model = MODELS[model_idx]
+            state.model = model
             return
         contents.append(types.Content(role="user", parts=[
             types.Part(function_response=types.FunctionResponse(id=call_id, name=name, response=payload))
@@ -339,7 +404,7 @@ async def _gemini_loop(client: genai.Client, ctx: RunContext, steps: _Steps, sta
         state.failure = "The Gemini agent didn't finish in time"
 
 
-async def _model_turn(client: genai.Client, model: str, contents: list[types.Content], state: LoopState):
+async def _model_turn(client: genai.Client, model: str, contents: list[types.Content], turn_id: str):
     """Stream one Gemini turn. Yields thought events, then (parts, finish_reason)."""
     config = types.GenerateContentConfig(
         system_instruction=AGENT_SYSTEM,
@@ -351,9 +416,6 @@ async def _model_turn(client: genai.Client, model: str, contents: list[types.Con
     )
     parts: list[types.Part] = []
     finish = None
-    for e in _thinking(state, model):
-        yield e
-    turn_id = f"a{state.attempt}"
     block, block_kind, n = None, None, 0
     try:
         stream = await client.aio.models.generate_content_stream(model=model, contents=contents, config=config)
@@ -393,12 +455,16 @@ async def _rule_based_plan(ctx: RunContext, steps: _Steps, reason: str) -> Async
     """Graceful degradation: build a simple plan with the same tools but no LLM."""
     yield _ev("status", message=f"{reason}. Building a simpler rule-based plan from the same data.")
     p = ctx.prefs
-    rainy = False
+    rainy = bool(ctx.weather and ctx.weather.get("max_rain_chance_in_window", 0) >= 60)
+    have = {"get_weather": ctx.weather is not None, "find_activities": any(x.kind == "activity" for x in ctx.places.values()),
+            "find_food": any(x.kind == "food" for x in ctx.places.values())}
     for name, args in (
         ("get_weather", {}),
         ("find_activities", None),
         ("find_food", None),
     ):
+        if have[name]:
+            continue
         if args is None:
             if name == "find_activities":
                 cats = _categories_for(p.interests, rainy)
@@ -422,7 +488,8 @@ async def _rule_based_plan(ctx: RunContext, steps: _Steps, reason: str) -> Async
     act = min(activities, key=lambda a: a.distance_km)
     food = min(foods, key=lambda f: (f.veg not in ("yes", "only"), haversine_km(act.lat, act.lon, f.lat, f.lon)))
 
-    start = to_min(p.start_time)
+    lead = travel_leg(ctx.center.lat, ctx.center.lon, act.lat, act.lon, ctx.city.country_code)["minutes"]
+    start = to_min(p.start_time) + 5 * -(-lead // 5)  # leave time to get there from the user's area
     act_minutes = max(45, min(120, int(p.available_minutes * 0.45)))
     gap = 30
     act_reasons = [f"only {act.distance_km:.1f} km away"]

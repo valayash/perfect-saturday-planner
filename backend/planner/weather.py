@@ -77,12 +77,15 @@ async def saturday_forecast(loc: Location, start_hhmm: str, minutes: int) -> dic
                 "sky": WMO.get(hourly["weather_code"][i], "unknown"),
             })
     max_rain = max((w["rain_chance"] for w in window), default=0)
+    wet = [int(w["hour"][:2]) for w in window if w["rain_chance"] >= 50]
+    rain_window = f"{min(wet):02d}:00–{max(wet) + 1:02d}:00" if wet else None
     daily = data["daily"]
     sunset = (daily.get("sunset") or [None])[0]
     return {
         "date": day.isoformat(),
-        "summary": _summary(window, max_rain),
+        "summary": _summary(window, max_rain) + (f" Rain likely around {rain_window}." if rain_window else ""),
         "max_rain_chance_in_window": max_rain,
+        "rain_window": rain_window,
         "temp_range_c": [round(daily["temperature_2m_min"][0]), round(daily["temperature_2m_max"][0])],
         "sunset": sunset[11:16] if sunset else None,
         "hourly": window,

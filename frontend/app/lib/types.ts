@@ -29,11 +29,12 @@ export type Preferences = {
   assumptions: string[];
 };
 
-export type Leg = { mode: string; km: number; minutes: number; cost: number };
+export type Leg = { mode: string; km: number; minutes: number; cost: number; from_start?: boolean; from?: string };
 
 export type PlanStop = {
   start: string;
   end: string;
+  minutes: number;
   name: string;
   category: string;
   activity: string;
@@ -43,10 +44,13 @@ export type PlanStop = {
   address: string | null;
   indoor: boolean;
   crowd: "low" | "medium" | "high";
+  crowd_label: string;
   veg: "yes" | "only" | "unverified" | "no" | null;
   opening_hours: string | null;
   source: "openstreetmap" | "curated";
   note: string | null;
+  lat: number;
+  lon: number;
   map_url: string;
   travel_from_previous: Leg | null;
 };
@@ -56,11 +60,16 @@ export type Plan = {
   summary: string;
   date: string | null;
   location: string;
+  start_label: string;
   weather: string | null;
+  rain_window: string | null;
+  energy: "low" | "medium" | "high";
   stops: PlanStop[];
+  home_leg: Leg | null;
   totals: {
     start: string;
     end: string;
+    home_at: string;
     minutes_used: number;
     available_minutes: number;
     travel_minutes: number;
@@ -70,15 +79,23 @@ export type Plan = {
   } | null;
   cost: {
     stops: { name: string; cost: number }[];
-    travel: ({ to: string } & Leg)[];
+    travel: ({ to: string; from?: string } & Leg)[];
+    places_total: number;
+    travel_total: number;
+    buffer: number;
     total: number;
     budget: number;
     currency: string;
   };
   tradeoffs: string[];
   plan_b: { trigger: string; suggestion: string; places: { name: string; map_url: string }[] };
+  worth_knowing: string[];
+  assumptions: string[];
+  route_url: string;
   warnings: string[];
+  validator_issues: number;
   data_sources: string[];
+  stats?: { llm_calls: number; tokens: number; seconds: number };
 };
 
 export type StepItem = {
@@ -86,6 +103,7 @@ export type StepItem = {
   id: string;
   name: string;
   label: string;
+  actor?: "llm" | "code";
   input?: unknown;
   status: "running" | "done" | "error";
   summary?: string;
@@ -98,7 +116,7 @@ export type StatusItem = { kind: "status"; id: string; message: string; tone?: "
 export type TraceItem = StepItem | ThoughtItem | StatusItem;
 
 export type AgentEvent =
-  | { type: "step_start"; id: string; name: string; label: string; input?: unknown }
+  | { type: "step_start"; id: string; name: string; label: string; input?: unknown; actor?: "llm" | "code" }
   | { type: "step_end"; id: string; ok: boolean; summary: string; source?: string | null; ms: number; output?: unknown }
   | { type: "thought_start"; block: string; kind: string }
   | { type: "thought_delta"; block: string; text: string }
@@ -107,4 +125,4 @@ export type AgentEvent =
   | { type: "clarify"; questions: string[]; assumptions: string[] }
   | { type: "plan"; plan: Plan; mode: "agent" | "rules"; model?: string }
   | { type: "error"; message: string; retryable: boolean }
-  | { type: "done"; seconds?: number };
+  | { type: "done"; seconds?: number; llm_calls?: number; tokens?: number };
