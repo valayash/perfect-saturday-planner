@@ -10,6 +10,7 @@ from .models import Location
 from .pricing import travel_rates
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+PHOTON_URL = "https://photon.komoot.io/api/"
 USER_AGENT = "perfect-saturday-planner/1.0 (take-home demo)"
 
 # Common alternate names the geocoder handles poorly.
@@ -69,7 +70,24 @@ async def resolve_location(city: str, area: str | None, country_code: str | None
             near = [c for c in candidates if haversine_km(city_loc.lat, city_loc.lon, c["latitude"], c["longitude"]) < 35]
             if near:
                 area_loc = _to_location(min(near, key=lambda c: haversine_km(city_loc.lat, city_loc.lon, c["latitude"], c["longitude"])))
+            else:  # Open-Meteo only knows populated places; Photon also knows markets, landmarks and suburbs
+                area_loc = await _photon_area(client, area.strip(), city_loc)
     return city_loc, area_loc
+
+
+async def _photon_area(client: httpx2.AsyncClient, area: str, city: Location) -> Location | None:
+    try:
+        resp = await client.get(PHOTON_URL, params={"q": area, "lat": city.lat, "lon": city.lon, "limit": 5, "lang": "en"}, timeout=5.0)
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+    except (httpx2.HTTPError, ValueError):
+        return None
+    for f in features:
+        lon, lat = f["geometry"]["coordinates"]
+        if haversine_km(city.lat, city.lon, lat, lon) < 35:
+            name = f["properties"].get("name") or area
+            return city.model_copy(update={"name": name, "lat": lat, "lon": lon, "label": f"{name}, {city.label}"})
+    return None
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
