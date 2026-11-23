@@ -42,7 +42,7 @@ The model can only use places the search tools returned (unknown `place_id`s are
 | Both live sources down, or no matches | Widens the radius once, then curated places (Bengaluru, Mumbai, Delhi), then honest generic suggestions |
 | Rain forecast | Indoor picks; plan B always included |
 | Plan breaks rules | Validator errors go back to the model to fix; warnings must be explained as trade-offs |
-| Gemini model overloaded (503) or rate-limited (429) | Switches to the next model in `GEMINI_MODELS` before the first turn; retries with backoff mid-run |
+| Gemini model overloaded (503) or rate-limited (429) | Switches to the next model in `GEMINI_MODELS`; mid-run it retries, then hands the work so far to the next model |
 | Gemini unavailable (no key, outage) | Rule-based parse + rule-based plan from the same tools, clearly labelled |
 | Weather API down | Plans for uncertainty, mixes indoor and outdoor |
 
@@ -64,7 +64,7 @@ npm install
 npm run dev
 ```
 
-Optional env vars: `GEMINI_MODELS` (comma-separated fallback chain, default `gemini-3.5-flash-lite,gemini-4-hydrogen,gemini-3.5-flash`) and `GEMINI_PARSE_MODEL` (default `gemini-3.5-flash-lite`).
+Optional env vars: `GEMINI_MODELS` (comma-separated fallback chain, default `gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen`) and `GEMINI_PARSE_MODEL` (default `gemini-3.5-flash-lite`).
 
 ## Deploy (Vercel)
 

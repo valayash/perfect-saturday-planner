@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -131,33 +132,38 @@ def _request_text(req: PlanRequest) -> str:
 
 
 PARSE_MODEL = os.getenv("GEMINI_PARSE_MODEL", "gemini-3.5-flash-lite")
+PARSE_BUDGET_S = 20
 
 
 async def parse_preferences(client: genai.Client | None, req: PlanRequest) -> tuple[Preferences, str]:
     """Returns (preferences, source) where source is 'gemini' or 'rules'."""
     fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-4-hydrogen").split(",") if m.strip()]
     prefs, source = None, "rules"
-    started = time.monotonic()
+    deadline = time.monotonic() + PARSE_BUDGET_S  # an overloaded Gemini should cost seconds, not a minute
     models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client else {}  # fast model first, then the rest of the chain
     for model in models:
-        if time.monotonic() - started > 30:
+        remaining = deadline - time.monotonic()
+        if remaining < 3:
             break
         try:
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=_request_text(req),
-                config=types.GenerateContentConfig(
-                    system_instruction=PARSE_SYSTEM,
-                    response_mime_type="application/json",
-                    response_json_schema=Preferences.model_json_schema(),
-                    thinking_config=types.ThinkingConfig(thinking_level="low"),
-                    http_options=types.HttpOptions(timeout=25_000, retry_options=types.HttpRetryOptions(attempts=2)),
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model,
+                    contents=_request_text(req),
+                    config=types.GenerateContentConfig(
+                        system_instruction=PARSE_SYSTEM,
+                        response_mime_type="application/json",
+                        response_json_schema=Preferences.model_json_schema(),
+                        thinking_config=types.ThinkingConfig(thinking_level="low"),
+                        http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1)),
+                    ),
                 ),
+                timeout=min(remaining, 12),
             )
             prefs, source = Preferences.model_validate_json(response.text or ""), "gemini"
             break
-        except Exception as err:  # overloaded, bad key, malformed JSON...: try the next model, then rules
-            log.warning("parse_preferences failed on %s: %s", model, str(err)[:200])
+        except Exception as err:  # overloaded, timed out, bad key, malformed JSON...: try the next model, then rules
+            log.warning("parse_preferences failed on %s: %s", model, (str(err) or type(err).__name__)[:200])
     if prefs is None:
         prefs = heuristic_preferences(req)
 

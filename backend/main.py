@@ -79,7 +79,7 @@ async def plan(req: PlanRequest, request: Request):
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=10)
+                    event = await asyncio.wait_for(queue.get(), timeout=5)
                 except asyncio.TimeoutError:
                     yield ": keep-alive\n\n"  # stops proxies from closing an idle stream
                     continue

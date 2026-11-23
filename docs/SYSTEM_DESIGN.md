@@ -144,8 +144,10 @@ stateDiagram-v2
     ModelTurn --> SwitchModel: 503/429/timeout before first good turn
     SwitchModel --> ModelTurn: next model in chain
     ModelTurn --> Retry: 503/429/timeout mid-run
-    Retry --> ModelTurn: backoff 1.5s, 3s, 4.5s
-    Retry --> RuleBased: retries exhausted
+    Retry --> ModelTurn: backoff 1.5s, 3s
+    Retry --> Handoff: retries exhausted
+    Handoff --> ModelTurn: next model, fresh history seeded with weather, places, last draft
+    Handoff --> RuleBased: no models left
     ModelTurn --> RuleBased: API error / turn limit / deadline
     RuleBased --> Done
     Done --> [*]
@@ -164,13 +166,13 @@ stateDiagram-v2
 | Use | Default model | Thinking | Why |
 |---|---|---|---|
 | Preference parsing | `gemini-3.5-flash-lite` | `low` | Fast, cheap, reliable structured JSON |
-| Agent loop | chain: `gemini-3.5-flash-lite` → `gemini-4-hydrogen` → `gemini-3.5-flash` | `low` (Hydrogen: `medium`) | During testing the larger models often returned 503 "high demand"; Flash-Lite answered in ~1–2 s |
+| Agent loop | chain: `gemini-3.5-flash-lite` → `gemini-3.8-flash` → `gemini-4-hydrogen` | `low` (Hydrogen: `medium`) | During testing the larger models often returned 503 "high demand"; Flash-Lite answered in ~1–2 s |
 
 All of it is configurable with `GEMINI_MODELS` and `GEMINI_PARSE_MODEL`.
 
 **Thought signatures.** Gemini 3+/4 attach signatures to function-call parts and require them back in the next request. The loop appends the model's parts **exactly as streamed**, empty parts included, and never merges them.
 
-**Why model switching only happens before the first good turn:** the signatures tie the conversation history to the model that produced them. After the first good turn, failures are retried on the same model with backoff. If that fails, the run drops to the rule-based planner, which reuses the same tools.
+**Why model switching only happens before the first good turn:** the signatures tie the conversation history to the model that produced them. After the first good turn, failures are retried on the same model with backoff. If that still fails, the run **hands off** to the next model: a fresh conversation seeded with the forecast, every place found so far (their `place_id`s stay valid because they live in the run's registry) and the last draft. Only when no models are left does it drop to the rule-based planner, which reuses the same tools. Agent turns time out after 20 s, so an overloaded model fails fast.
 
 ---
 
@@ -227,7 +229,7 @@ flowchart TD
 
 ## 8. Streaming protocol (SSE)
 
-`POST /api/plan` returns `text/event-stream`. Each event is `data: <json>\n\n`. A `: keep-alive` comment goes out every 10 s of silence so proxies don't close the stream.
+`POST /api/plan` returns `text/event-stream`. Each event is `data: <json>\n\n`. A `: keep-alive` comment goes out every 5 s of silence so proxies don't close the stream.
 
 | Event | Payload | UI use |
 |---|---|---|
@@ -257,8 +259,8 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 | Vague input / no city | parse result | 1–2 clarifying questions, then a re-run with the answers | Question card |
 | Unknown city | geocoder returns nothing | Clarifying question | Question card |
 | Gemini overloaded / rate-limited (first turn) | 503, 429, timeout | Next model in the chain | ℹ️ status in the trace |
-| Gemini overloaded mid-run | same | 3 retries with backoff on the same model, then the rule-based plan | ℹ️ / ⚠️ status |
-| Gemini parse fails | any exception | Next model, then the rule-based parser (reads form, free text and answers) | `RULES` badge |
+| Gemini overloaded mid-run | same | 2 retries on the same model, then hand off to the next model with a summary of the work so far, then the rule-based plan | ℹ️ / ⚠️ status |
+| Gemini parse fails | any exception or 12 s per-model timeout (20 s total budget) | Next model, then the rule-based parser (reads form, free text and answers) | `RULES` badge |
 | Gemini unavailable (bad key, outage) | API error | Rule-based plan using the same tools and validator | "Rule-based backup plan" label |
 | Overpass at capacity | HTTP error or timeout | Photon results; Overpass skipped for 10 min | `live` (Photon) |
 | No live places | empty results | Widen radius, then curated, then generic | `fallback` / `generic` badge, "curated data" pill |

@@ -19,12 +19,12 @@ from .prompts import AGENT_SYSTEM
 from .tools import TOOL_SPECS, FinalStop, PlanB, SubmitIn, build_final_plan, run_tool
 
 # Tried in order; the run switches to the next model if one is overloaded before its first turn succeeds.
-MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-4-hydrogen,gemini-3.5-flash").split(",") if m.strip()]
+MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
 MID_RUN_RETRIES = 2  # then hand off to the next model with a summary (history is tied to one model's thought signatures)
 THINKING_LEVEL = {"gemini-4-hydrogen": "medium", "gemini-4-neon": "medium"}  # others: "low"
 MAX_TURNS = 10
 DEADLINE_S = 240  # Vercel Hobby functions stop at 300s
-TURN_TIMEOUT_MS = 45_000
+TURN_TIMEOUT_MS = 20_000
 
 GEMINI_TOOLS = types.Tool(function_declarations=[
     types.FunctionDeclaration(name=t["name"], description=t["description"], parameters_json_schema=t["parameters"])
