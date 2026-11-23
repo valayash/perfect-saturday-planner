@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react";
 import { StreamStalled, pollRun, runPlanJson, streamPlan } from "../lib/stream";
-import type { AgentEvent, Plan, PlanRequest, Preferences, TraceItem } from "../lib/types";
+import type { AgentEvent, ClarifyQuestion, Plan, PlanRequest, Preferences, TraceItem } from "../lib/types";
 import InputPanel from "./InputPanel";
 import PlanView from "./PlanView";
 import TracePanel from "./TracePanel";
@@ -14,7 +14,8 @@ export default function Planner() {
   const [trace, setTrace] = useState<TraceItem[]>([]);
   const [prefs, setPrefs] = useState<Preferences | null>(null);
   const [plan, setPlan] = useState<{ plan: Plan; mode: "agent" | "rules"; model?: string } | null>(null);
-  const [questions, setQuestions] = useState<string[]>([]);
+  const [questions, setQuestions] = useState<ClarifyQuestion[]>([]);
+  const [clarifySummary, setClarifySummary] = useState("");
   const [answers, setAnswers] = useState<string[]>([]);
   const [error, setError] = useState<{ message: string; retryable: boolean } | null>(null);
   const [startedAt, setStartedAt] = useState<number | null>(null);
@@ -51,8 +52,9 @@ export default function Planner() {
         setPrefs(e.preferences);
         break;
       case "clarify":
-        setQuestions(e.questions);
+        setQuestions(e.questions.map((q, i) => (typeof q === "string" ? { id: `q${i}`, question: q, options: [] } : q)));
         setAnswers(e.questions.map(() => ""));
+        setClarifySummary(e.summary ?? "");
         setPhase("clarify");
         break;
       case "plan":
@@ -145,7 +147,7 @@ export default function Planner() {
       ...base,
       clarifications: [
         ...(base.clarifications ?? []),
-        ...questions.map((q, i) => ({ question: q, answer: answers[i]?.trim() || "no preference" })),
+        ...questions.map((q, i) => ({ question: q.question, answer: answers[i]?.trim() || "no preference" })),
       ],
     });
   };
@@ -183,24 +185,50 @@ export default function Planner() {
           {prefs && phase !== "idle" && <PrefsSummary prefs={prefs} />}
 
           {phase === "clarify" && (
-            <form onSubmit={submitAnswers} className="rounded-2xl border border-accent/40 bg-accent-soft p-4 sm:p-5">
-              <h2 className="text-sm font-semibold text-ink">A couple of quick questions first</h2>
-              <p className="mt-0.5 text-xs text-muted">Your request was a bit open-ended, so here’s what would help me plan something good.</p>
-              <div className="mt-3 space-y-3">
+            <form onSubmit={submitAnswers} className="rounded-2xl border border-line bg-surface-2 p-4 shadow-sm sm:p-5">
+              <div className="flex items-start gap-3">
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-ink text-base text-bg">💬</span>
+                <div>
+                  <h2 className="text-sm font-semibold text-ink">A few details first</h2>
+                  <p className="mt-0.5 text-xs text-muted">{clarifySummary || "Your request was a bit open-ended."} I’d rather ask than guess.</p>
+                </div>
+              </div>
+              <div className="mt-4 space-y-4">
                 {questions.map((q, i) => (
-                  <label key={q} className="block">
-                    <span className="mb-1 block text-sm text-ink">{q}</span>
+                  <div key={q.id}>
+                    <div className="mb-1.5 text-sm font-medium text-ink">{q.question}</div>
+                    {q.options.length > 0 && (
+                      <div className="mb-2 flex flex-wrap gap-1.5">
+                        {q.options.map((opt) => (
+                          <button
+                            key={opt}
+                            type="button"
+                            onClick={() => setAnswers((a) => a.map((x, j) => (j === i ? opt : x)))}
+                            className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                              answers[i] === opt ? "border-ink bg-ink text-bg" : "border-line bg-surface text-ink hover:border-ink/50"
+                            }`}
+                          >
+                            {opt}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     <input
                       autoFocus={i === 0}
                       value={answers[i] ?? ""}
+                      placeholder="Or type your answer"
                       onChange={(ev) => setAnswers((a) => a.map((x, j) => (j === i ? ev.target.value : x)))}
-                      className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none"
+                      className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-muted/70 focus:border-ink focus:outline-none"
                     />
-                  </label>
+                  </div>
                 ))}
               </div>
-              <button type="submit" className="mt-4 rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white hover:opacity-90">
-                Continue planning
+              <button
+                type="submit"
+                disabled={answers.some((a) => !a.trim())}
+                className="mt-5 w-full rounded-xl bg-ink px-4 py-3 text-sm font-semibold text-bg transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Continue →
               </button>
             </form>
           )}

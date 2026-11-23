@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -165,7 +166,7 @@ def _gather_calls(ctx: RunContext) -> list[tuple[None, str, dict]]:
     interest_cats = _categories_for(p.interests, rainy=False)
     indoor = ["arts_centre", "gallery", "museum", "bookstore", "live_music"]
     activity_cats = (interest_cats + [c for c in indoor if c not in interest_cats])[:6]
-    food_cats = ["cafe", "restaurant"] + (["dessert"] if any("dessert" in i or "sweet" in i for i in p.interests) else [])
+    food_cats = _food_categories(p)
     return [
         (None, "get_weather", {}),
         (None, "find_activities", {"categories": activity_cats, "radius_km": 5}),
@@ -197,7 +198,10 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     yield steps.end(sid, t0, f"{who}: {prefs.city or 'no city'} · {prefs.start_time}, {prefs.available_minutes} min · {round(prefs.budget)} {prefs.currency} · {prefs.energy} energy", source=parse_source, output=prefs.model_dump())
     yield _ev("preferences", preferences=prefs.model_dump(), source=parse_source)
     if prefs.needs_clarification:
-        yield _ev("clarify", questions=prefs.clarifying_questions, assumptions=prefs.assumptions)
+        asks = meta.get("questions") or [{"id": f"q{i}", "question": q, "options": []} for i, q in enumerate(prefs.clarifying_questions)]
+        missing = [q["id"] for q in asks if q["id"] in ("city", "budget", "time", "mood")]
+        summary = ("Missing " + ", ".join({"mood": "what you're in the mood for"}.get(m, m) for m in missing) + ".") if missing else "Your request was a bit open-ended."
+        yield _ev("clarify", questions=asks, summary=summary, assumptions=prefs.assumptions)
         return
 
     # 2. resolve the city / neighbourhood (code)
@@ -528,16 +532,37 @@ async def _rule_based_plan(ctx: RunContext, steps: _Steps, reason: str) -> Async
     yield _ev("done")
 
 
+INTEREST_CATEGORIES: list[tuple[tuple[str, ...], str]] = [
+    (("bowling",), "bowling"), (("arcade", "gaming", "video game", "game"), "arcade"), (("escape",), "escape_room"),
+    (("music", "gig", "concert", "jazz", "band", "dj"), "live_music"), (("comedy", "stand-up", "standup", "theatre", "theater", "play"), "theatre"),
+    (("movie", "film", "cinema"), "cinema"), (("art", "painting", "gallery"), "gallery"), (("culture", "workshop", "talk"), "arts_centre"),
+    (("museum", "science"), "museum"), (("history", "heritage", "monument", "fort", "palace"), "historic"),
+    (("book", "read"), "bookstore"), (("library",), "library"), (("walk", "nature", "outdoor", "park", "green"), "park"),
+    (("lake", "water"), "lake"), (("garden", "flower"), "garden"), (("view", "sunset"), "viewpoint"),
+    (("sport", "climb", "badminton", "football", "cricket", "gym", "swim"), "sports"), (("shopping", "mall"), "mall"),
+    (("market", "flea", "bazaar"), "market"), (("spa", "massage"), "spa"), (("fun",), "arcade"),
+]
+
+
 def _categories_for(interests: list[str], rainy: bool) -> list[str]:
     text = " ".join(interests).lower()
     cats = []
-    for words, cat in (
-        (("walk", "nature", "outdoor", "park"), "park"), (("walk", "lake", "water"), "lake"),
-        (("music", "gig", "concert"), "live_music"), (("art", "culture"), "gallery"), (("museum", "history"), "museum"),
-        (("book", "read"), "bookstore"), (("movie", "film"), "cinema"), (("game", "fun"), "arcade"), (("theatre", "play"), "theatre"),
-    ):
+    for words, cat in INTEREST_CATEGORIES:
         if any(w in text for w in words) and cat not in cats:
             cats.append(cat)
     if rainy:
-        cats = [c for c in cats if c not in ("park", "lake")] + ["bookstore", "museum"]
-    return (cats or ["park", "bookstore", "gallery"])[:5]
+        cats = [c for c in cats if c not in ("park", "lake", "garden", "viewpoint")] + ["bookstore", "museum"]
+    return (cats or ["park", "bookstore", "gallery"])[:6]
+
+
+def _food_categories(prefs) -> list[str]:
+    text = " ".join(prefs.interests).lower()
+    sober = any(re.search(r"alcohol|sober|teetotal", c, re.I) for c in prefs.hard_constraints + prefs.soft_constraints)
+    cats = ["cafe", "restaurant"]
+    if re.search(r"beer|drink|pub|bar\b|cocktail|wine|brew", text) and not sober:
+        cats.append("bar")
+    if re.search(r"dessert|sweet|ice cream|bakery", text):
+        cats.append("dessert")
+    if re.search(r"street food|chaat|snack", text):
+        cats.append("street_food")
+    return cats

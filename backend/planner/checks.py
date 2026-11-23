@@ -61,6 +61,8 @@ def crowd_at(place: Place, minute: int) -> str:
     cat = place.category
     if cat in ("restaurant", "street_food", "fast_food"):
         level += 1 if (12 <= hour < 14 or 19 <= hour < 22) else -1 if 15 <= hour < 18 else 0
+    elif cat == "bar":
+        level += 1 if 20 <= hour < 24 else -1 if hour < 18 else 0
     elif cat in ("park", "garden", "lake", "viewpoint"):
         level += 1 if 16 <= hour < 19 else -1 if 12 <= hour < 15 else 0
     elif cat in ("mall", "market", "cinema", "arcade", "bowling"):

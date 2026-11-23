@@ -56,6 +56,23 @@ INTEREST_WORDS = {
 CONSTRAINT_WORDS = {"vegetarian": r"\bveg(etarian)?\b", "vegan": r"vegan", "jain food": r"\bjain\b", "avoid crowded places": r"crowd|quiet|calm", "no alcohol": r"no alcohol|sober|don'?t drink"}
 
 
+KNOWN_CITIES = [
+    "new delhi", "delhi", "gurugram", "gurgaon", "noida", "bengaluru", "bangalore", "mumbai", "bombay", "navi mumbai", "pune",
+    "hyderabad", "chennai", "madras", "kolkata", "calcutta", "ahmedabad", "jaipur", "goa", "kochi", "cochin", "chandigarh",
+    "lucknow", "indore", "surat", "mysuru", "mysore", "udaipur", "bhopal", "nagpur", "visakhapatnam", "coimbatore",
+    "london", "new york", "paris", "singapore", "dubai", "tokyo", "sydney", "san francisco", "berlin", "amsterdam", "toronto",
+]
+
+
+def _known_city(text: str) -> str | None:
+    """Find a well-known city name anywhere in the text, in any case ("i'm in gurgaon")."""
+    low = text.lower()
+    for name in sorted(KNOWN_CITIES, key=len, reverse=True):  # longest first: "new delhi" before "delhi"
+        if re.search(rf"\b{re.escape(name)}\b", low):
+            return name.title()
+    return None
+
+
 def _split_city(text: str) -> tuple[str | None, str | None]:
     """'Pune, around Koregaon Park' -> ('Pune', 'Koregaon Park')."""
     text = text.strip().strip(".")
@@ -76,6 +93,8 @@ def heuristic_preferences(req: PlanRequest) -> Preferences:
     for c in req.clarifications:
         if not city and is_where(c.question):
             city, area = _split_city(c.answer)[0], area or _split_city(c.answer)[1]
+    if not city and req.free_text:
+        city = _known_city(req.free_text)
     if not city and req.free_text:
         m = re.search(r"\b(?:in|at|around)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)", req.free_text)
         city = m.group(1) if m else None
@@ -229,7 +248,82 @@ async def parse_preferences(
         prefs.needs_clarification = True
         prefs.clarifying_questions = prefs.clarifying_questions[:2] or ["Which city will you be in on Saturday?"]
     prefs.clarifying_questions = prefs.clarifying_questions[:2]
-    prefs.available_minutes = min(max(prefs.available_minutes, 45), 720)
-    if not re.fullmatch(r"\d{1,2}:\d{2}", prefs.start_time):
+    if req.free_text and not req.city:  # chat mode: ask for missing essentials instead of assuming them
+        asks = missing_details(req, prefs)
+        if asks:
+            prefs.needs_clarification = True
+            prefs.clarifying_questions = [q["question"] for q in asks]
+            meta["questions"] = asks
+        elif prefs.city:
+            prefs.needs_clarification, prefs.clarifying_questions = False, []
+    if not re.fullmatch(r"\d{1,2}:\d{2}", prefs.start_time) or not (6 * 60 <= _to_min(prefs.start_time) <= 22 * 60):
         prefs.start_time = "14:00"
+    room = LATEST_END - _to_min(prefs.start_time)  # plans end by 23:00, whatever the model guessed
+    if prefs.available_minutes > room:
+        prefs.assumptions.append(f"Plans end by 23:00, so this one runs {prefs.start_time}–23:00 ({room // 60} h {room % 60:02d} min).")
+    prefs.available_minutes = max(45, min(prefs.available_minutes, room, 720))
     return prefs, source
+
+
+LATEST_END = 23 * 60
+
+# ---------- chat mode: what's missing? (code, not model judgement, so nothing is silently assumed) ----------
+
+CITY_ALIASES = {"bengaluru": ["bangalore", "bengaluru", "blr"], "mumbai": ["mumbai", "bombay"], "delhi": ["delhi", "new delhi"],
+                "gurugram": ["gurugram", "gurgaon"], "kolkata": ["kolkata", "calcutta"], "chennai": ["chennai", "madras"]}
+MONEY = re.compile(r"₹|\brs\.?\s*\d|\binr\b|rupee|\$|£|€|\busd\b|\beur\b|\bgbp\b|bucks|budget|\b\d+\s*k\b|"
+                   r"\b\d{3,6}\b(?!\s*(?:hrs?|hours?|mins?|minutes?|am|pm|:|-|to\b))|free|no limit|cheap", re.I)
+DURATION = re.compile(r"\b\d+(?:\.\d+)?\s*(?:h|hr|hrs|hour|hours|mins?|minutes?)\b|half[- ]day|full[- ]day|whole day|all day|"
+                      r"\b(?:till|until|to|-|–)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b.*|\bafternoon\b|\bevening\b|\bmorning\b|\bnight\b", re.I)
+START = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{1,2}:\d{2}\b|\bnoon\b|after lunch|morning|afternoon|evening|night", re.I)
+MOOD_OR_INTEREST = re.compile(
+    r"tired|exhaust|lazy|chill|relax|calm|cozy|cosy|happy|bored|sad|stressed|energ|excit|adventur|romantic|social|curious|"
+    r"food|eat|cafe|café|coffee|music|gig|walk|park|nature|art|museum|book|read|history|movie|film|game|bowling|arcade|"
+    r"shop|beer|drink|pub|bar\b|dessert|street food|theatre|comedy|sport|lake|garden|photograph|culture", re.I)
+
+
+def _answered(req: PlanRequest) -> dict[str, str]:
+    """Which details earlier clarifying answers covered (keyed by our question ids)."""
+    got = {}
+    for c in req.clarifications:
+        q = c.question.lower()
+        key = "city" if "city" in q else "budget" if "budget" in q else "time" if ("time" in q or "how long" in q) else "mood" if "mood" in q else None
+        if key:
+            got[key] = c.answer.strip()
+    return got
+
+
+def missing_details(req: PlanRequest, prefs: Preferences) -> list[dict]:
+    text = " ".join([req.free_text or ""] + [c.answer for c in req.clarifications])
+    low = text.lower()
+    got = _answered(req)
+    asks = []
+
+    city = (prefs.city or "").strip().lower()
+    names = next((v for v in CITY_ALIASES.values() if city in v or any(a == city for a in v)), [city] if city else [])
+    if "city" not in got and not (city and any(n and n in low for n in names)):
+        asks.append({"id": "city", "question": "Which city would you like to plan for?", "options": ["Bangalore", "Mumbai", "Delhi"]})
+
+    india = (prefs.country_code or "IN") == "IN" or not prefs.city
+    if "budget" not in got and not MONEY.search(text):
+        opts = ["₹500", "₹1500", "₹3000"] if india else ["25", "60", "120"]
+        asks.append({"id": "budget", "question": "What's your budget per person for the day?", "options": opts})
+
+    if "time" not in got and not DURATION.search(text):
+        start = START.search(text)
+        if start:
+            s = start.group(0)
+            asks.append({"id": "time", "question": f"How much time do you have from {s}?", "options": ["2 hours", "4 hours", "Until 10 pm"]})
+        else:
+            asks.append({"id": "time", "question": "How much time do you have, and from when?",
+                         "options": ["4 hours from 3 pm", "Afternoon, 12–6 pm", "Evening, 5–10 pm", "Whole day, 10 am–8 pm"]})
+
+    if "mood" not in got and not MOOD_OR_INTEREST.search(text):
+        asks.append({"id": "mood", "question": "What are you in the mood for?",
+                     "options": ["Chill: coffee, books, walks", "Foodie: cafés and street food", "Culture: art, museums, music", "Active: games, sports, exploring"]})
+    return asks
+
+
+def _to_min(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)

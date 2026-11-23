@@ -90,10 +90,19 @@ CURATED: dict[str, list[tuple[str, str, float, float, dict]]] = {
     ],
 }
 
+CURATED["gurugram"] = [
+    ("CyberHub, DLF Cyber City", "restaurant", 28.4950, 77.0890, {"veg": "yes", "est_cost": 800, "crowd": "high", "note": "dining hub with dozens of restaurants, cafés and bars"}),
+    ("Sector 29 market", "bar", 28.4687, 77.0650, {"est_cost": 900, "crowd": "high", "note": "Gurugram's pub street, next to Leisure Valley"}),
+    ("Galleria Market, DLF Phase IV", "market", 28.4669, 77.0827, {"crowd": "high", "note": "busy food and shopping strip"}),
+    ("Ambience Mall, Gurugram", "mall", 28.5049, 77.0960, {"crowd": "high", "note": "large mall with a food court and an entertainment zone"}),
+    ("Leisure Valley Park", "park", 28.4706, 77.0700, {"crowd": "medium"}),
+]
+
 CITY_KEYS = {
     "bengaluru": "bengaluru", "bangalore": "bengaluru",
     "mumbai": "mumbai", "bombay": "mumbai",
     "delhi": "delhi", "new delhi": "delhi",
+    "gurugram": "gurugram", "gurgaon": "gurugram",
 }
 
 

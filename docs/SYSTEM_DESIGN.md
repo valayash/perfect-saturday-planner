@@ -111,7 +111,7 @@ sequenceDiagram
 
 | Phase | What happens | LLM? |
 |---|---|---|
-| 1. `parse_preferences` | Normalise the input into a typed `Preferences` object: city, area, budget, currency, minutes, start time, mood, **energy level**, interests, **hard vs soft constraints**, assumptions. Decides whether to ask clarifying questions. | Gemini structured output, with a rule-based fallback |
+| 1. `parse_preferences` | Normalise the input into a typed `Preferences` object: city, area, budget, currency, minutes, start time, mood, **energy level**, interests, **hard vs soft constraints**, assumptions. Decides whether to ask clarifying questions: in chat mode a code check (`missing_details`) asks for any missing city, budget, time or mood instead of assuming, with quick-pick options. Time windows are clamped to end by 23:00. | `gpt-oss-20b` via AI Gateway (then Gemini), laid over a rule-based reading |
 | 2. `resolve_location` | Geocode the city (the most populous match) and neighbourhood (the match nearest the city). An unknown city becomes a clarifying question. | No |
 | 3. Gather | Weather, activity candidates and food candidates, fetched **by code in parallel** (curated-first, topped up with live OSM). | No |
 | 4. Plan + revise | The model plans from the gathered candidates and calls `submit_plan` directly; the server repairs timing, validates, and returns real problems for one revision. It can still call the search tools for genuine gaps (max 2 searches). | AI Gateway (`gpt-oss-120b` on Cerebras/Groq), then Gemini |
@@ -278,7 +278,7 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 
 | Failure | Detection | Behaviour | Shown to the user |
 |---|---|---|---|
-| Vague input / no city | parse result | 1–2 clarifying questions, then a re-run with the answers | Question card |
+| Missing details (chat mode) | `missing_details` on the user's own words | Ask for exactly the missing city / budget / time / mood (quick picks + free text), once each; then re-run with the answers | Question card |
 | Unknown city | geocoder returns nothing | Clarifying question | Question card |
 | Gemini overloaded / rate-limited (first turn) | 503, 429, timeout | Next model in the chain | ℹ️ status in the trace |
 | Gemini overloaded mid-run | same | 2 retries on the same model, then hand off to the next model with a summary of the work so far, then the rule-based plan | ℹ️ / ⚠️ status |

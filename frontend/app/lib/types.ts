@@ -1,4 +1,5 @@
 export type Clarification = { question: string; answer: string };
+export type ClarifyQuestion = { id: string; question: string; options: string[] };
 
 export type PlanRequest = {
   city?: string;
@@ -122,7 +123,7 @@ export type AgentEvent =
   | { type: "thought_delta"; block: string; text: string }
   | { type: "status"; message: string; tone?: "info" | "warn" }
   | { type: "preferences"; preferences: Preferences; source: string }
-  | { type: "clarify"; questions: string[]; assumptions: string[] }
+  | { type: "clarify"; questions: (string | ClarifyQuestion)[]; summary?: string; assumptions: string[] }
   | { type: "plan"; plan: Plan; mode: "agent" | "rules"; model?: string }
   | { type: "error"; message: string; retryable: boolean }
   | { type: "done"; seconds?: number; llm_calls?: number; tokens?: number };

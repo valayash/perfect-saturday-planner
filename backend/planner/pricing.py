@@ -35,6 +35,7 @@ CATEGORIES: dict[str, tuple[str, bool, str, float, float]] = {
     "fast_food": ("food", True, "medium", 250, 12),
     "dessert": ("food", True, "low", 180, 7),
     "street_food": ("food", False, "high", 150, 8),
+    "bar": ("food", True, "medium", 800, 20),
 }
 
 ACTIVITY_CATEGORIES = [c for c, meta in CATEGORIES.items() if meta[0] == "activity"]

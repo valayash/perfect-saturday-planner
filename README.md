@@ -12,7 +12,7 @@ Browser (Next.js) ──POST /api/plan──▶ FastAPI (Python) ──▶ LLM t
         ◀──────── Server-Sent Events: trace steps, thinking, final plan ────────
 ```
 
-1. **`parse_preferences`**: an LLM (structured JSON output) turns the form or free text into typed preferences: minutes, energy level, hard vs soft constraints. If the input is too vague (no city, "plan something fun"), it asks 1–2 clarifying questions instead of guessing.
+1. **`parse_preferences`**: an LLM (structured JSON output) turns the form or free text into typed preferences: minutes, energy level, hard vs soft constraints. In chat ("Just describe it") mode it never assumes the essentials: if the city, budget, time (how long and from when) or mood is missing, code detects it and the agent asks for exactly those, each with quick-pick suggestions. Plans always end by 23:00.
 2. **`resolve_location`**: geocodes the city and neighbourhood (Open-Meteo).
 3. **Gather (code, in parallel)**: Saturday's forecast plus activity and food candidates near the user's area: well-known curated places first (with hours, prices and veg status), topped up with live OpenStreetMap results.
 4. **Plan + revise (LLM agent)**: the model gets the candidates and calls `submit_plan`. The server fixes timing slips itself (moves stops later to fit real travel time, rounds to 5 min), validates the rest and sends back anything the model must fix. Typically 2 LLM calls in total (~6K tokens, ~10–20 s), with `gpt-oss` served by Cerebras/Groq through Vercel AI Gateway.
@@ -42,7 +42,7 @@ The model can only use places the search tools returned (unknown `place_id`s are
 
 | Situation | What happens |
 |---|---|
-| Vague input / no city | 1–2 clarifying questions, answered inline, then it continues |
+| Missing details in chat mode (city, budget, time, mood) | One question card listing exactly what's missing, with quick picks; each detail is asked once, then it plans |
 | Unknown city | Asks which city you mean |
 | Overpass overloaded | Photon answers instead (trace shows the source) |
 | Both live sources down, or no matches | Widens the radius once, then curated places (Bengaluru, Mumbai, Delhi), then honest generic suggestions |

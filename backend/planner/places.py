@@ -58,6 +58,7 @@ PHOTON_QUERIES: dict[str, list[tuple[str, str]]] = {
     "fast_food": [("food", "amenity:fast_food")],
     "dessert": [("ice cream", "amenity:ice_cream"), ("bakery", "shop:bakery")],
     "street_food": [("food court", "amenity:food_court")],
+    "bar": [("pub", "amenity:pub"), ("bar", "amenity:bar")],
 }
 
 VEG_NAME = re.compile(r"\b(pure veg|veg|vegetarian|vegan)\b", re.I)
@@ -91,6 +92,7 @@ SELECTORS: dict[str, list[str]] = {
     "fast_food": ['["amenity"="fast_food"]'],
     "dessert": ['["amenity"="ice_cream"]', '["shop"~"^(bakery|confectionery|pastry)$"]'],
     "street_food": ['["amenity"="food_court"]'],
+    "bar": ['["amenity"~"^(bar|pub|biergarten)$"]'],
 }
 
 # Cuisines that are a poor bet for vegetarians even if the place is untagged.
@@ -200,6 +202,8 @@ async def _photon(categories: list[str], center: Location, radius_km: float, cou
     queries = [(cat, *PHOTON_QUERIES[cat][0]) for cat in categories if cat in PHOTON_QUERIES]
     if vegetarian and "restaurant" in categories:
         queries.append(("restaurant", "veg", "amenity:restaurant"))
+    if "bar" in categories:
+        queries.append(("bar", *PHOTON_QUERIES["bar"][1]))
     async with httpx2.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
         results = await asyncio.gather(*(one(client, *q) for q in queries), return_exceptions=True)
     places = [p for r in results if isinstance(r, list) for p in r]
@@ -382,7 +386,7 @@ async def find_places(
             _photon_down_until = time.monotonic() + PHOTON_COOLDOWN
             raise PlacesUnavailable(f"Live search took over {live_budget:g}s; using what's on hand.")
         live = _filter(raw, indoor_only, vegetarian, max_price)
-        if len(live) + len(curated) < 4 and radius_km < 12:
+        if not live and not curated and radius_km < 12:
             wider = min(12, radius_km * 2)
             notes.append(f"Only {len(live) + len(curated)} matches within {radius_km:g} km, widened the search to {wider:g} km.")
             try:
