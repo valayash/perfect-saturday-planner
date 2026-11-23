@@ -2,7 +2,7 @@
 
 An AI agent that plans a fun, realistic Saturday from your city, budget, time, mood, interests and constraints. It checks the real forecast, finds real places near you, checks the plan is actually doable, explains why each stop fits you, and shows a live trace of everything it did.
 
-**Live URL:** _add after deploy_ · **System design:** [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)
+**Live URL:** https://perfect-saturday-planner-nine.vercel.app · **System design:** [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)
 
 ## How it works
 
