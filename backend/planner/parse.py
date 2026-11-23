@@ -133,12 +133,13 @@ def _request_text(req: PlanRequest) -> str:
 PARSE_MODEL = os.getenv("GEMINI_PARSE_MODEL", "gemini-3.5-flash-lite")
 
 
-async def parse_preferences(client: genai.Client, req: PlanRequest) -> tuple[Preferences, str]:
+async def parse_preferences(client: genai.Client | None, req: PlanRequest) -> tuple[Preferences, str]:
     """Returns (preferences, source) where source is 'gemini' or 'rules'."""
     fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-4-hydrogen").split(",") if m.strip()]
     prefs, source = None, "rules"
     started = time.monotonic()
-    for model in dict.fromkeys([PARSE_MODEL, *fallbacks]):  # try the fast model first, then the rest of the chain
+    models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client else {}  # fast model first, then the rest of the chain
+    for model in models:
         if time.monotonic() - started > 30:
             break
         try:

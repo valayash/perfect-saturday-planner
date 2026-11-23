@@ -79,7 +79,10 @@ def _user_message(ctx: RunContext) -> str:
 async def run(req: PlanRequest) -> AsyncIterator[dict]:
     started = time.monotonic()
     steps = _Steps()
-    client = genai.Client()  # reads GEMINI_API_KEY
+    try:
+        client: genai.Client | None = genai.Client()  # reads GEMINI_API_KEY
+    except Exception:  # e.g. no API key configured: run the rule-based planner instead
+        client = None
 
     # 1. understand preferences
     ev, sid, t0 = steps.start("parse_preferences", "Understanding your preferences", req.model_dump(exclude_none=True, exclude_defaults=True))
