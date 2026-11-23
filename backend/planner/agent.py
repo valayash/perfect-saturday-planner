@@ -20,7 +20,7 @@ from .tools import TOOL_SPECS, FinalStop, PlanB, SubmitIn, build_final_plan, run
 
 # Tried in order; the run switches to the next model if one is overloaded before its first turn succeeds.
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-4-hydrogen,gemini-3.5-flash").split(",") if m.strip()]
-MID_RUN_RETRIES = 3  # after the first good turn the history is tied to one model, so retry it with backoff
+MID_RUN_RETRIES = 2  # then hand off to the next model with a summary (history is tied to one model's thought signatures)
 THINKING_LEVEL = {"gemini-4-hydrogen": "medium", "gemini-4-neon": "medium"}  # others: "low"
 MAX_TURNS = 10
 DEADLINE_S = 240  # Vercel Hobby functions stop at 300s
@@ -76,6 +76,21 @@ def _user_message(ctx: RunContext) -> str:
     )
 
 
+def _handoff_message(ctx: RunContext, last_draft: dict | None) -> str:
+    """Seed a different model with everything gathered so far (place_ids stay valid: they live in ctx.places)."""
+    work = {
+        "weather": ctx.weather,
+        "places_found": [p.brief() for p in list(ctx.places.values())[:40]],
+        "last_draft": last_draft,
+    }
+    return (
+        _user_message(ctx)
+        + "\n\nAnother planner already gathered the data below before it became unavailable. Use these place_ids "
+        "(you may call tools again if you need more), then validate the plan and finish by calling submit_plan.\n"
+        + json.dumps(work, ensure_ascii=False)
+    )
+
+
 async def run(req: PlanRequest) -> AsyncIterator[dict]:
     started = time.monotonic()
     steps = _Steps()
@@ -122,14 +137,16 @@ async def run(req: PlanRequest) -> AsyncIterator[dict]:
 
     contents: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=_user_message(ctx))])]
     model_idx, good_turns, retries, submit_attempts = 0, 0, 0, 0
+    last_draft: dict | None = None
     yield _ev("status", message=f"Agent model: {MODELS[model_idx]}", tone="info")
-    turn = 0
+    turn = attempt = 0
     while turn < MAX_TURNS and time.monotonic() - started < DEADLINE_S:
         parts: list[types.Part] | None = None
         finish = None
         reason = ""
+        attempt += 1
         try:
-            async for item in _model_turn(client, MODELS[model_idx], contents, f"t{turn}"):
+            async for item in _model_turn(client, MODELS[model_idx], contents, f"a{attempt}"):
                 if isinstance(item, dict):
                     yield item
                 else:
@@ -143,6 +160,11 @@ async def run(req: PlanRequest) -> AsyncIterator[dict]:
                 retries += 1
                 yield _ev("status", message=f"{err}. Retrying ({retries}/{MID_RUN_RETRIES})…", tone="info")
                 await asyncio.sleep(1.5 * retries)
+                continue
+            if model_idx + 1 < len(MODELS):  # hand off: fresh conversation for the next model, seeded with the work so far
+                model_idx, retries, good_turns = model_idx + 1, 0, 0
+                contents = [types.Content(role="user", parts=[types.Part(text=_handoff_message(ctx, last_draft))])]
+                yield _ev("status", message=f"{err}. Handing the work so far to {MODELS[model_idx]}.")
                 continue
             reason = f"The AI model is overloaded ({err})"
         except errors.APIError as err:  # bad key, invalid request...
@@ -182,6 +204,8 @@ async def run(req: PlanRequest) -> AsyncIterator[dict]:
             yield steps.end(sid, t0, out.summary, ok=not out.is_error, source=out.source, output=out.result)
             payload = {"error": out.result} if out.is_error else out.result
             responses.append(types.Part(function_response=types.FunctionResponse(id=fc.id, name=fc.name, response=payload)))
+            if fc.name in ("validate_plan", "estimate_cost", "submit_plan") and not out.final_plan:
+                last_draft = {"tool": fc.name, "input": fc.args, "result": out.result}
             if fc.name == "submit_plan":
                 submit_attempts += 1
                 final_plan = out.final_plan or final_plan

@@ -268,18 +268,22 @@ def _diverse_top(places: list[Place], limit: int, vegetarian: bool) -> list[Plac
     return out
 
 
+JUNK_NAME = re.compile(r"(park|garden|playground|ground|lake|pond|cafe|restaurant|shop|store)\s*\d*", re.I)
+
+
 def _filter(places: list[Place], indoor_only: bool, vegetarian: bool, max_price: float | None) -> list[Place]:
     out = []
     seen_names = set()
     for p in places:
-        if p.name.lower() in seen_names:
+        if p.name.lower() in seen_names or len(p.name) < 3 or JUNK_NAME.fullmatch(p.name.strip()):
             continue
         if indoor_only and not p.indoor:
             continue
         if vegetarian and p.kind == "food":
             if p.veg == "no" or (p.veg == "unverified" and p.cuisine and MEAT_CUISINES.search(p.cuisine)):
                 continue
-        if max_price is not None and p.est_cost > max_price * 1.25:
+        # OSM has no prices: live places carry flat category estimates, so only filter places with known prices
+        if max_price is not None and p.source == "curated" and p.est_cost > max_price * 1.25:
             continue
         seen_names.add(p.name.lower())
         out.append(p)
@@ -365,8 +369,12 @@ async def find_places(
         notes.append(str(err))
 
     curated = _filter(curated_places(city, center, kind, categories), indoor_only, vegetarian, max_price)
-    if curated:
+    nearby = [p for p in curated if p.distance_km <= max(radius_km * 3, 6)]
+    if curated and not nearby:
+        nearby = sorted(curated, key=lambda p: p.distance_km)[:3]
+        notes.append(f"Nearest curated options are {nearby[0].distance_km:.0f}+ km away.")
+    if nearby:
         notes.append("Using curated fallback places for this city.")
-        return _diverse_top(curated, limit, vegetarian), "fallback", notes
+        return _diverse_top(nearby, limit, vegetarian), "fallback", notes
     notes.append("No curated data for this city either; returning generic suggestions.")
     return generic_places(center, kind, country_code), "generic", notes
