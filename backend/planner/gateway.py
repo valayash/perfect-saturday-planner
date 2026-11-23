@@ -14,9 +14,10 @@ from openai import AsyncOpenAI
 from .tools import TOOL_SPECS
 
 GATEWAY_URL = "https://ai-gateway.vercel.sh/v1"
+# Defaults are all on AI Gateway's free tier, support tool calling and JSON-schema output, and come from different model families.
 GATEWAY_MODELS = [
     m.strip()
-    for m in os.getenv("AI_GATEWAY_MODELS", "openai/gpt-oss-120b,anthropic/claude-haiku-5.5,google/gemini-3.5-flash-lite").split(",")
+    for m in os.getenv("AI_GATEWAY_MODELS", "openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash").split(",")
     if m.strip()
 ]
 

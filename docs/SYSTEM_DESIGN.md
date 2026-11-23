@@ -37,7 +37,7 @@ flowchart LR
     end
     A --- Agent
 
-    LOOP -- "chat completions + tools" --> GW[("Vercel AI Gateway<br/>gpt-oss-120b, Claude Haiku 5.5,<br/>Gemini Flash-Lite")]
+    LOOP -- "chat completions + tools" --> GW[("Vercel AI Gateway<br/>gpt-oss-120b, Gemini 2.5 Flash-Lite,<br/>Qwen 3.7 Flash")]
     LOOP -. "if the gateway fails" .-> G[("Gemini API<br/>model fallback chain")]
     P -- "structured JSON" --> GW
     T -- "forecast" --> OM[("Open-Meteo<br/>weather + geocoding")]
@@ -168,7 +168,7 @@ stateDiagram-v2
 
 | Stage | Models (in order) | Auth | Notes |
 |---|---|---|---|
-| Vercel AI Gateway | `openai/gpt-oss-120b` → `anthropic/claude-haiku-5.5` → `google/gemini-3.5-flash-lite` | The project's **OIDC token** on Vercel (no key to manage); `AI_GATEWAY_API_KEY` locally | OpenAI-format JSON history, so switching models mid-run is safe; ≈ $0.005 per plan on gpt-oss-120b |
+| Vercel AI Gateway | `openai/gpt-oss-120b` → `google/gemini-2.5-flash-lite` → `alibaba/qwen3.7-flash` (all free-tier eligible, all tested end to end) | The project's **OIDC token** on Vercel (no key to manage); `AI_GATEWAY_API_KEY` locally | OpenAI-format JSON history, so switching models mid-run is safe; ≈ $0.005 per plan on gpt-oss-120b |
 | Gemini API | the table below | `GEMINI_API_KEY` | Used when the gateway is unavailable |
 | Rules | none | none | Same tools and validator, no LLM |
 

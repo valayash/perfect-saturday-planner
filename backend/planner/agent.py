@@ -187,21 +187,21 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     state = LoopState(started=started)
 
     # 3. agent loop: AI Gateway, then Gemini, then rules
-    if parse_source != "rules":
-        stages = []
-        if gateway and parse_source != "gemini":  # if parsing already fell through to Gemini, the gateway is down
-            stages.append(_gateway_loop(gateway, ctx, steps, state))
-        if gemini:
-            stages.append(_gemini_loop(gemini, ctx, steps, state))
-        for stage in stages:
-            async for e in stage:
-                yield e
-            if state.final_plan:
-                yield _ev("plan", plan=state.final_plan, mode="agent", model=state.model)
-                yield _ev("done", seconds=round(time.monotonic() - started, 1))
-                return
-            if state.out_of_time():
-                break
+    # (Even if parsing fell back to rules, the agent may still work: a parse failure can be one model's JSON quirk.)
+    stages = []
+    if gateway:
+        stages.append(_gateway_loop(gateway, ctx, steps, state))
+    if gemini:
+        stages.append(_gemini_loop(gemini, ctx, steps, state))
+    for stage in stages:
+        async for e in stage:
+            yield e
+        if state.final_plan:
+            yield _ev("plan", plan=state.final_plan, mode="agent", model=state.model)
+            yield _ev("done", seconds=round(time.monotonic() - started, 1))
+            return
+        if state.out_of_time():
+            break
     reason = state.failure or ("The agent ran out of time before finishing" if state.out_of_time() else "The AI model is unavailable right now")
     async for e in _rule_based_plan(ctx, steps, reason=reason):
         yield e

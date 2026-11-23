@@ -43,7 +43,7 @@ The model can only use places the search tools returned (unknown `place_id`s are
 | Both live sources down, or no matches | Widens the radius once, then curated places (Bengaluru, Mumbai, Delhi), then honest generic suggestions |
 | Rain forecast | Indoor picks; plan B always included |
 | Plan breaks rules | Validator errors go back to the model to fix; warnings must be explained as trade-offs |
-| A model is overloaded (503) or rate-limited (429) | Next model in the chain: AI Gateway models first (`gpt-oss-120b` → `claude-haiku-5.5` → `gemini-3.5-flash-lite`), then the Gemini API models; the work so far is handed over |
+| A model is overloaded (503) or rate-limited (429) | Next model in the chain: AI Gateway models first (`gpt-oss-120b` → `gemini-2.5-flash-lite` → `qwen3.7-flash`, all on the free tier), then the Gemini API models; the work so far is handed over |
 | Gemini unavailable (no key, outage) | Rule-based parse + rule-based plan from the same tools, clearly labelled |
 | Weather API down | Plans for uncertainty, mixes indoor and outdoor |
 | Live stream stalls in transit | The browser collects the finished run from the server (`GET /api/plan/{run_id}`), or re-runs once without streaming |
@@ -68,7 +68,7 @@ npm run dev
 
 LLM providers (any one is enough; the chain uses whatever is configured): `AI_GATEWAY_API_KEY` (local only; on Vercel the project's OIDC token is used automatically) and/or `GEMINI_API_KEY`.
 
-Optional env vars: `AI_GATEWAY_MODELS` (default `openai/gpt-oss-120b,anthropic/claude-haiku-5.5,google/gemini-3.5-flash-lite`), `GEMINI_MODELS` (comma-separated fallback chain, default `gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen`) and `GEMINI_PARSE_MODEL` (default `gemini-3.5-flash-lite`).
+Optional env vars: `AI_GATEWAY_MODELS` (default `openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash`), `GEMINI_MODELS` (comma-separated fallback chain, default `gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen`) and `GEMINI_PARSE_MODEL` (default `gemini-3.5-flash-lite`).
 
 ## Deploy (Vercel)
 
