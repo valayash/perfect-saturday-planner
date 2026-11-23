@@ -32,6 +32,7 @@ THINKING_LEVEL = {"gemini-4-hydrogen": "medium", "gemini-4-neon": "medium"}  # o
 MAX_TURNS = 10
 DEADLINE_S = 240  # Vercel Hobby functions stop at 300s
 TURN_TIMEOUT_MS = 20_000
+GATEWAY_TURN_TIMEOUT_S = 45  # reasoning models on long turns need more than the Gemini fail-fast budget
 NUDGE = "Please continue: validate your plan and finish by calling submit_plan."
 
 GEMINI_TOOLS = types.Tool(function_declarations=[
@@ -216,7 +217,10 @@ async def _gateway_loop(client: AsyncOpenAI, ctx: RunContext, steps: _Steps, sta
         for e in _thinking(state, model):
             yield e
         try:
-            resp = await client.chat.completions.create(model=model, messages=messages, tools=OPENAI_TOOLS, max_tokens=8000)
+            extra = {"reasoning_effort": "low"} if model.startswith("openai/gpt-oss") else {}  # faster turns, the validator checks the work
+            resp = await client.chat.completions.create(
+                model=model, messages=messages, tools=OPENAI_TOOLS, max_tokens=8000, timeout=GATEWAY_TURN_TIMEOUT_S, **extra
+            )
         except Exception as err:
             if is_account_problem(err):
                 state.failure = f"Vercel AI Gateway refused the request ({error_text(err)})"
