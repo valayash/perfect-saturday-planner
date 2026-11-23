@@ -249,9 +249,9 @@ flowchart TD
 
 ## 8. Streaming protocol (SSE)
 
-`POST /api/plan` returns `text/event-stream`. The browser sends a `run_id`, and the server keeps every run's events in memory for 15 minutes, decoupled from the HTTP stream. If a stream stalls in transit (seen intermittently on Vercel: the server had sent everything, the browser received nothing), the browser's watchdog notices 20 s of silence and calls `GET /api/plan/{run_id}` for the rest. That's an ordinary JSON response, and it waits for the run to finish. If another instance answers (404), the browser falls back to `POST /api/plan?mode=json`, a non-streaming run.
+`POST /api/plan` returns `text/event-stream`. The browser sends a `run_id`, and the server keeps every run's events in memory for 15 minutes, decoupled from the HTTP stream. If a stream stalls in transit (seen intermittently on Vercel: the server had sent everything, the browser received nothing), the browser's watchdog notices 12 s of silence (keep-alives go out every 3 s) and switches to long-polling `GET /api/plan/{run_id}?after=N`, short ordinary JSON requests that each return new events as soon as they exist, so the trace keeps updating. If another instance answers (404), the browser falls back to `POST /api/plan?mode=json`, a non-streaming run.
 
-Each event is `data: <json>\n\n`. A `: keep-alive` comment goes out every 5 s of silence so proxies don't close the stream.
+Each event is `data: <json>\n\n`. A `: keep-alive` comment goes out every 3 s of silence so proxies don't close the stream.
 
 | Event | Payload | UI use |
 |---|---|---|
@@ -291,7 +291,7 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 | Plan breaks rules | `validate_plan` errors | Sent back to the model (up to 2 rejections), then accepted with visible warnings | "Heads-up" box |
 | Safety block | finish reason | Error message, not retryable | Error card |
 | Too slow | 240 s deadline (Vercel limit 300 s) | Rule-based plan | ⚠️ status |
-| Stream stalls in transit | browser watchdog: 20 s without bytes (keep-alives every 5 s) | Collect the stored run with `GET /api/plan/{run_id}`, else one non-streaming re-run | ℹ️ status in the trace |
+| Stream stalls in transit | browser watchdog: 12 s without bytes (keep-alives every 3 s) | Long-poll the stored run with `GET /api/plan/{run_id}?after=N`, else one non-streaming re-run | ℹ️ status in the trace |
 | Abuse | per-IP limit, 10 requests / 10 min | HTTP 429 | Error card |
 
 ---

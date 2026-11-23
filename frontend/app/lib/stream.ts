@@ -1,7 +1,7 @@
 import type { AgentEvent, PlanRequest } from "./types";
 
-/** The server sends a keep-alive every 5 s, so this much silence means the connection is stuck. */
-const STALL_MS = 20_000;
+/** The server sends a keep-alive every 3 s, so this much silence means the connection is stuck. */
+const STALL_MS = 12_000;
 
 export class StreamStalled extends Error {}
 
@@ -58,12 +58,12 @@ export async function streamPlan(
   if (stalled) throw new StreamStalled("The connection to the planner stalled.");
 }
 
-/** Collect a run's stored events (the server waits until it finishes). null if another server instance ran it. */
-export async function fetchRunResult(runId: string, signal: AbortSignal): Promise<AgentEvent[] | null> {
-  const res = await fetch(`/api/plan/${encodeURIComponent(runId)}`, { signal });
+/** Long-poll a run's stored events from `after` on. null if another server instance ran it. */
+export async function pollRun(runId: string, after: number, signal: AbortSignal): Promise<{ events: AgentEvent[]; done: boolean } | null> {
+  const res = await fetch(`/api/plan/${encodeURIComponent(runId)}?after=${after}&wait=8`, { signal });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Couldn't collect the result (${res.status})`);
-  return ((await res.json()) as { events: AgentEvent[] }).events;
+  return (await res.json()) as { events: AgentEvent[]; done: boolean };
 }
 
 /** Non-streaming fallback: run the whole plan and get every event in one ordinary response. */

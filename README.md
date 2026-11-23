@@ -51,7 +51,7 @@ The model can only use places the search tools returned (unknown `place_id`s are
 | A model is overloaded (503) or rate-limited (429) | Next model in the chain: AI Gateway models first (`gpt-oss-120b` → `gemini-2.5-flash-lite` → `qwen3.7-flash`, all on the free tier), then the Gemini API models; the work so far is handed over |
 | Gemini unavailable (no key, outage) | Rule-based parse + rule-based plan from the same tools, clearly labelled |
 | Weather API down | Plans for uncertainty, mixes indoor and outdoor |
-| Live stream stalls in transit | The browser collects the finished run from the server (`GET /api/plan/{run_id}`), or re-runs once without streaming |
+| Live stream stalls in transit | The browser switches to long-polling the stored run (`GET /api/plan/{run_id}?after=N`), or re-runs once without streaming |
 
 ## Run locally
 

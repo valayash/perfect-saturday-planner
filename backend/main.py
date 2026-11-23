@@ -128,7 +128,7 @@ async def plan(req: PlanRequest, request: Request, mode: str = "stream"):
                 elif r.done.is_set():
                     break
                 else:
-                    if time.monotonic() - quiet_since >= 5:
+                    if time.monotonic() - quiet_since >= 3:
                         yield ": keep-alive\n\n"  # stops proxies from closing an idle stream
                         quiet_since = time.monotonic()
                     await asyncio.sleep(0.2)
@@ -143,13 +143,13 @@ async def plan(req: PlanRequest, request: Request, mode: str = "stream"):
 
 
 @app.get("/api/plan/{run_id}")
-async def plan_result(run_id: str):
-    """Collect a run's events (waiting for it to finish). 404 if this server instance didn't run it."""
+async def plan_result(run_id: str, after: int = 0, wait: float = 8.0):
+    """Long-poll a run's events: returns events[after:] as soon as there are new ones (or after `wait` seconds).
+    Used when a live stream stalls in transit. 404 if this server instance didn't run it."""
     r = _runs.get(run_id)
     if not r:
         raise HTTPException(status_code=404, detail="Unknown run on this server instance.")
-    try:
-        await asyncio.wait_for(r.done.wait(), timeout=max(1.0, RUN_WAIT_S - (time.monotonic() - r.created)))
-    except asyncio.TimeoutError:
-        pass
-    return {"events": r.events, "done": r.done.is_set()}
+    deadline = time.monotonic() + max(0.0, min(wait, 20.0))
+    while len(r.events) <= after and not r.done.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+    return {"events": r.events[after:], "next": len(r.events), "done": r.done.is_set()}

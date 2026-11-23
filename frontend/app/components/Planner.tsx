@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { StreamStalled, fetchRunResult, runPlanJson, streamPlan } from "../lib/stream";
+import { StreamStalled, pollRun, runPlanJson, streamPlan } from "../lib/stream";
 import type { AgentEvent, Plan, PlanRequest, Preferences, TraceItem } from "../lib/types";
 import InputPanel from "./InputPanel";
 import PlanView from "./PlanView";
@@ -107,11 +107,18 @@ export default function Planner() {
       }
       // 2. The stream stalled or dropped in transit: the server keeps every run, so collect the rest of it.
       if (!sawEnd && !ctrl.signal.aborted) {
-        note("Live updates stalled in transit. Collecting the rest of the run from the server…");
-        const events = await fetchRunResult(runId, ctrl.signal);
-        if (events) {
-          events.slice(seen).forEach(onEvent);
-        } else {
+        note("The live stream stalled in transit, so I'm following the run by polling instead…");
+        let gone = false;
+        for (let i = 0; i < 40 && !sawEnd && !ctrl.signal.aborted; i++) {
+          const batch = await pollRun(runId, seen, ctrl.signal);
+          if (!batch) {
+            gone = true;
+            break;
+          }
+          batch.events.forEach(onEvent);
+          if (batch.done) break;
+        }
+        if (gone) {
           // 3. A different server instance answered: run once more without live updates.
           note("That server instance is gone, so I'm planning once more without live updates (about 30–60 s)…");
           setTrace((t) => t.filter((i) => i.kind === "status"));
@@ -216,7 +223,7 @@ export default function Planner() {
       </div>
 
       <footer className="mt-10 text-center text-xs text-muted">
-        Built with Gemini, OpenStreetMap (Overpass + Photon) and Open-Meteo. Place data © OpenStreetMap contributors.
+        Built with open models on Vercel AI Gateway (Cerebras/Groq), Gemini as backup, OpenStreetMap and Open-Meteo. Place data © OpenStreetMap contributors.
       </footer>
     </div>
   );
