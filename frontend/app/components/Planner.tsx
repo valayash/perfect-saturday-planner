@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { streamPlan } from "../lib/stream";
+import { StreamStalled, streamPlan } from "../lib/stream";
 import type { AgentEvent, Plan, PlanRequest, Preferences, TraceItem } from "../lib/types";
 import InputPanel from "./InputPanel";
 import PlanView from "./PlanView";
@@ -68,6 +68,26 @@ export default function Planner() {
     }
   };
 
+  /** One streamed attempt. Returns null on success, or the failure and whether a retry could help. */
+  const attemptOnce = async (req: PlanRequest, ctrl: AbortController): Promise<{ failure: string; retryable: boolean } | null> => {
+    const t0 = Date.now();
+    setStartedAt(t0);
+    let sawEnd = false;
+    try {
+      await streamPlan(req, (e) => {
+        if (e.type === "plan" || e.type === "clarify" || e.type === "error") sawEnd = true;
+        handle(e);
+      }, ctrl.signal);
+      return sawEnd ? null : { failure: "The connection closed before the plan was ready.", retryable: true };
+    } catch (err) {
+      if (ctrl.signal.aborted || sawEnd) return null;
+      const dropped = err instanceof StreamStalled || err instanceof TypeError; // stalled or network error
+      return { failure: dropped ? "The connection to the planner stalled." : err instanceof Error ? err.message : "Network error", retryable: dropped };
+    } finally {
+      setDoneSeconds((s) => s ?? Math.round((Date.now() - t0) / 100) / 10);
+    }
+  };
+
   const start = async (req: PlanRequest) => {
     abort.current?.abort();
     const ctrl = new AbortController();
@@ -75,30 +95,23 @@ export default function Planner() {
     lastRequest.current = req;
     setPhase("running");
     setTrace([]);
-    setPlan(null);
     setPrefs(null);
+    setPlan(null);
     setError(null);
     setQuestions([]);
     setDoneSeconds(null);
-    const t0 = Date.now();
-    setStartedAt(t0);
     requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    let sawEnd = false;
-    try {
-      await streamPlan(req, (e) => {
-        if (e.type === "plan" || e.type === "clarify" || e.type === "error") sawEnd = true;
-        handle(e);
-      }, ctrl.signal);
-      if (!sawEnd) {
-        setError({ message: "The connection closed before the plan was ready. Please try again.", retryable: true });
-        setPhase("error");
-      }
-    } catch (err) {
-      if (ctrl.signal.aborted) return;
-      setError({ message: err instanceof Error ? err.message : "Network error", retryable: true });
+    let result = await attemptOnce(req, ctrl);
+    if (result?.retryable && !ctrl.signal.aborted) {
+      // Streams through serverless platforms occasionally stall; one automatic retry usually gets through.
+      const note = `${result.failure} Retrying once…`;
+      setTrace((t) => [...t, { kind: "status", id: `status-retry-${t.length}`, message: note }]);
+      setDoneSeconds(null);
+      result = await attemptOnce(req, ctrl);
+    }
+    if (result && !ctrl.signal.aborted) {
+      setError({ message: `${result.failure} Please try again.`, retryable: true });
       setPhase("error");
-    } finally {
-      setDoneSeconds((s) => s ?? Math.round((Date.now() - t0) / 100) / 10);
     }
   };
 

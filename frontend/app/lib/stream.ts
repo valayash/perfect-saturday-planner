@@ -1,5 +1,10 @@
 import type { AgentEvent, PlanRequest } from "./types";
 
+/** The server sends a keep-alive every 5 s, so this much silence means the connection is stuck. */
+const STALL_MS = 20_000;
+
+export class StreamStalled extends Error {}
+
 /** POST the request and call onEvent for every Server-Sent Event the agent streams back. */
 export async function streamPlan(
   payload: PlanRequest,
@@ -24,17 +29,31 @@ export async function streamPlan(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let sep: number;
-    while ((sep = buffer.indexOf("\n\n")) !== -1) {
-      const chunk = buffer.slice(0, sep);
-      buffer = buffer.slice(sep + 2);
-      for (const line of chunk.split("\n")) {
-        if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)) as AgentEvent);
+  let lastByte = Date.now();
+  let stalled = false;
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastByte > STALL_MS) {
+      stalled = true;
+      reader.cancel().catch(() => {});
+    }
+  }, 2_000);
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      lastByte = Date.now();
+      buffer += decoder.decode(value, { stream: true });
+      let sep: number;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const chunk = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        for (const line of chunk.split("\n")) {
+          if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)) as AgentEvent);
+        }
       }
     }
+  } finally {
+    clearInterval(watchdog);
   }
+  if (stalled) throw new StreamStalled("The connection to the planner stalled.");
 }

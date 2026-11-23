@@ -76,6 +76,7 @@ async def plan(req: PlanRequest, request: Request):
                 await queue.put(None)
 
         task = asyncio.create_task(produce())
+        sent, last_type, t0 = 0, "", time.monotonic()
         try:
             while True:
                 try:
@@ -86,8 +87,10 @@ async def plan(req: PlanRequest, request: Request):
                 if event is None:
                     break
                 yield _sse(event)
+                sent, last_type = sent + 1, event.get("type", "")
         finally:
             task.cancel()
+            log.info("stream closed after %.1fs: %d events sent, last=%s, agent_finished=%s", time.monotonic() - t0, sent, last_type, task.done())
 
     return StreamingResponse(
         stream(),
