@@ -70,11 +70,22 @@ Each plan has travel legs from your area and back home, costs with a 5% buffer, 
 <!-- results -->
 Latest run against the live site, every scenario twice:
 
-**8/10 scenarios passed every check in every run (18/20 runs clean).** Plans took 0.1–16.5 s (median 7.2 s); agent plans used 2.6 LLM calls on average.
+**7/10 scenarios passed every check in every run (17/20 runs clean).** Plans took 0.1–21.8 s (median 7.7 s); agent plans used 2.4 LLM calls on average.
 
 | Scenario | Result | Checks | Stops (first passing run) | Time | LLM calls | Tokens |
 |---|---|---|---|---|---|---|
-| The assignment's example input | ⚠️ 1/2 runs | 11/11 | Venkatappa Art Gallery → Chowdiah Memorial Hall → Konark Kanteerava | 6.9 s | 3 | 15456 |
+| The assignment's example input | ⚠️ 1/2 runs | 11/11 | Cubbon Park → Konark Kanteerava → Chowdiah Memorial Hall | 5.1 s | 2 | 7861 |
+| Vague chat request | ✅ 2/2 runs | 2/2 | asked: city, budget, time, mood | 2.0 s | 0 | 0 |
+| Vague request + answers (Pune) | ✅ 2/2 runs | 10/10 | 7 to 9 Grams Coffee → Osho Teerth Park → Shahu Modak Udyan | 4.7 s | 2 | 7330 |
+| Rain all afternoon (simulated) | ✅ 2/2 runs | 8/8 | Ainmane → Manora → Artisera → Champaca | 7.4 s | 2.5 | 10883 |
+| Smaller city with thin map data (Nashik) | ✅ 2/2 runs | 8/8 | Baba Ambedkar Municipal Gardens → Kulkarni's Pav Bhaji → WeGo Art Gallery and Art Exhibition | 9.8 s | 2 | 6436 |
+| Tight budget (₹300 in Mumbai) | ⚠️ 1/2 runs | 8/8 | Colaba Woods Garden → art gallery → Kitab Khana | 14.9 s | 3.5 | 19526 |
+| Wish only available far away (bowling, Gurugram) | ⚠️ 1/2 runs | 9/9 | The Big Shot → The Laugh Store | 12.2 s | 3.5 | 21314 |
+| History, art and a North Indian lunch (Delhi) | ✅ 2/2 runs | 9/9 | Barah Khamba → Lokayata Art Gallery → Maheshi Da Frontier Punjabi Dhaba → OPS → Kunzum | 11.7 s | 2 | 7498 |
+| Outside India (London) | ✅ 2/2 runs | 9/9 | National Gallery → Notes → National Portrait Gallery | 7.1 s | 2 | 6974 |
+| Every LLM unavailable (simulated) | ✅ 2/2 runs | 9/9 | St. John's Auditorium → Utsav | 1.0 s | 0 | 0 |
+
+The misses change from run to run because LLM output does. This time: a crowded park picked despite "avoid crowds" without a trade-off, a budget plan still at ₹369 against ₹300 after its two revisions, and bowling left out without saying why. The first two still reach the user as heads-up warnings on the plan; the third is a gap the evals exposed.
 <!-- /results -->
 
 The set earned its keep: it caught the model skipping an interest the user named (the matching candidates are now listed for it up front), budget plans that never walked anywhere (walks up to ~1 km are now free, and budget eateries get cheaper estimates), and a stricter rule that made plans slower and worse (rolled back to a single nudge).
