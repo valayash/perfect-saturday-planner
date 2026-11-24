@@ -115,13 +115,13 @@ def _seed_message(ctx: RunContext, last_draft: dict | None) -> str:
     weather = {k: v for k, v in (ctx.weather or {}).items() if k != "hourly"} | {"hourly": (ctx.weather or {}).get("hourly", [])}
     def brief(p):
         leg = travel_leg(ctx.center.lat, ctx.center.lon, p.lat, p.lon, ctx.city.country_code)
-        return p.brief() | {"minutes_from_start": leg["minutes"]}
+        return p.brief() | {"minutes_from_start": leg["minutes"], "ride_cost_from_start": leg["cost"]}
 
     data = {
         "weather": weather if ctx.weather else "unavailable: plan for uncertain weather",
         "activity_candidates": [brief(p) for p in ctx.places.values() if p.kind == "activity"][:20],
         "food_candidates": [brief(p) for p in ctx.places.values() if p.kind == "food"][:20],
-        "travel_rule_of_thumb": "between two stops allow ~6 min plus ~3-4 min per km by auto/cab; walking under ~1 km",
+        "travel_rule_of_thumb": "between two stops allow ~6 min plus ~3-4 min per km by auto/cab; up to ~1 km apart is a free walk",
     }
     if ctx.hints:
         data["notes"] = ctx.hints
@@ -163,6 +163,15 @@ async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: li
             state.final_plan = out.final_plan or state.final_plan
 
 
+def _simulated_rain(weather: dict) -> dict:
+    """Failure drill: the real forecast for the day, with rain likely in every hour of the user's window."""
+    hourly = [{**h, "rain_chance": 90, "sky": "moderate rain"} for h in weather.get("hourly", [])]
+    hours = [h["hour"] for h in hourly]
+    rain_window = f"{hours[0]}–{int(hours[-1][:2]) + 1:02d}:00" if hours else None
+    return {**weather, "hourly": hourly, "max_rain_chance_in_window": 90, "rain_window": rain_window,
+            "summary": f"moderate rain (simulated); rain likely, plan indoor options (max 90%). Rain likely around {rain_window}."}
+
+
 def _far_wanted(ctx: RunContext, radius_km: float = 5) -> Place | None:
     """The nearest match for an activity the user asked for by name, when every match is beyond the search radius."""
     for cat in sorted(ctx.wanted):
@@ -196,6 +205,9 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         gemini: genai.Client | None = genai.Client()  # reads GEMINI_API_KEY
     except Exception:  # no API key configured
         gemini = None
+    if "llm_down" in req.simulate:  # failure drill: behave as if every model provider were unreachable
+        gateway = gemini = None
+        state.failure = "The AI models are switched off for this run (simulated outage)"
 
     # 1. understand preferences (LLM)
     ev, sid, t0 = steps.start("parse_preferences", "Understanding your request", req.model_dump(exclude={"run_id"}, exclude_none=True, exclude_defaults=True), actor="llm")
@@ -251,6 +263,9 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         yield e
     # Something asked for by name is only found far away: gather food around it too, so the model can build
     # the outing there instead of pairing it with stops across town.
+    if "rain" in req.simulate and ctx.weather is not None:
+        ctx.weather = _simulated_rain(ctx.weather)
+        yield _ev("status", message="Simulating heavy rain for this run: the forecast now shows a 90% chance of rain all through your window.")
     if far := _far_wanted(ctx):
         ctx.hints.append(
             f"The only {far.category.replace('_', ' ')} found is {far.name}, {far.distance_km:.0f} km from the user's area. Food candidates "
@@ -281,6 +296,8 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
             break
     reason = state.failure or ("The agent ran out of time before finishing" if state.out_of_time() else "The AI model is unavailable right now")
     async for e in _rule_based_plan(ctx, steps, reason=reason):
+        if e["type"] == "done":  # same stats as an agent run, so the UI and the evals can compare them
+            e = _ev("done", seconds=round(time.monotonic() - started, 1), llm_calls=state.llm_calls, tokens=state.tokens)
         yield e
 
 

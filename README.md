@@ -17,7 +17,7 @@ Browser (Next.js) ──POST /api/plan──▶ FastAPI (Python) ──▶ LLM t
 3. **Gather (code, in parallel)**: Saturday's forecast plus activity and food candidates near the user's area from a live places API (Geoapify, or the public OpenStreetMap servers); curated places only fill gaps and add known prices, hours and veg status to matching live results.
 4. **Plan + revise (LLM agent)**: the model gets the candidates and calls `submit_plan`. The server fixes timing slips itself (moves stops later to fit real travel time, rounds to 5 min), validates the rest and sends back anything the model must fix. Typically 2 LLM calls in total (~6K tokens, ~10–20 s), with `gpt-oss` served by Cerebras/Groq through Vercel AI Gateway.
 
-Plans include the ride from the user's area to the first stop and back home ("home around 19:04"), a 5% budget buffer, crowd level at that hour, the rain window, a plain-language "Worth knowing" list, the parser's assumptions and a Google Maps route.
+Plans include the ride from the user's area to the first stop and back home ("home around 19:04"), a 5% budget buffer, crowd level at that hour, the rain window, a plain-language "Worth knowing" list, the parser's assumptions, a **route map** with numbered stops (Geoapify Static Maps, served through a signed `/api/map` URL so the key stays on the server) and a Google Maps route.
 
 Tools:
 
@@ -36,7 +36,8 @@ The model can only use places the search tools returned (unknown `place_id`s are
 
 - **Places:** live from **Geoapify Places** (OpenStreetMap data with opening hours, `diet:vegetarian` and cuisine tags; free key, no card) when `GEOAPIFY_API_KEY` is set. Without it, or if it fails, two free keyless OSM APIs race each other: **Overpass** (rich tags, often at capacity) and **Photon** (fast search). Neighbourhoods are geocoded through Geoapify too. Curated places (Bengaluru, Mumbai, Delhi, Gurugram) only fill thin results.
 - **Weather + geocoding:** Open-Meteo.
-- **Prices and crowd levels** aren't in OSM, so they're category heuristics (tuned for India, generic elsewhere) and labelled "est." everywhere.
+- **Prices and crowd levels** aren't in OSM, so they're category heuristics (tuned for India, generic elsewhere; names like "canteen", "Udupi" or "dhaba" get a budget-eatery estimate) and labelled "est." everywhere.
+- **Opening hours** come from OpenStreetMap tags when a place has them. Geoapify's Place Details endpoint was tested as a second source and added nothing (0 of 24 places), so plans say "check hours" when OSM doesn't know.
 
 ## Failure handling
 
@@ -53,6 +54,14 @@ The model can only use places the search tools returned (unknown `place_id`s are
 | Gemini unavailable (no key, outage) | Rule-based parse + rule-based plan from the same tools, clearly labelled |
 | Weather API down | Plans for uncertainty, mixes indoor and outdoor |
 | Live stream stalls in transit | The browser switches to long-polling the stored run (`GET /api/plan/{run_id}?after=N`), or re-runs once without streaming |
+
+Two failure drills are built in, for the evals and for anyone testing the API: add `"simulate": ["rain"]` to a request to force rain through the whole window, or `"simulate": ["llm_down"]` to run with every LLM unavailable (you get the rule-based plan).
+
+## Evals
+
+`python3 evals/run_evals.py` sends 10 fixed requests to the live API (or `--base http://localhost:8000`) and checks each result automatically: the plan passes the server's validation, has 2–5 explained and distinct stops, stays inside the budget and time window, has a route map, and meets the scenario's own expectations (vegetarian food only, indoor in rain, a free stop on a tight budget, asking before planning a vague request, and so on). It writes [`evals/RESULTS.md`](evals/RESULTS.md).
+
+_Latest run: results below are filled in by the most recent run against the live site._
 
 ## Run locally
 
@@ -94,7 +103,7 @@ vercel deploy --prod
 ```
 vercel.json              two services: web (Next.js) + api (FastAPI)
 frontend/app/            Next.js UI: form, live trace, plan view
-backend/main.py          FastAPI app: SSE endpoint, keep-alives, simple rate limit
+backend/main.py          FastAPI app: SSE endpoint, keep-alives, simple rate limit, route map endpoint
 backend/planner/
   agent.py               provider chain: AI Gateway loop → Gemini loop → rule-based plan
   gateway.py             Vercel AI Gateway client (OpenAI-compatible, OIDC or key auth)
@@ -102,7 +111,9 @@ backend/planner/
   tools.py               tool schemas, execution, final plan assembly
   places.py              Geoapify + Overpass + Photon, curated/generic fallbacks
   checks.py              estimate_cost, validate_plan
+  maps.py                route map images behind signed /api/map URLs
   geo.py, weather.py, hours.py, pricing.py, fallback_data.py
+evals/run_evals.py       10 fixed scenarios with automatic checks (see Evals)
 ```
 
 ## How I used AI tools

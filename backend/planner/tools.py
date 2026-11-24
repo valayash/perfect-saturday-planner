@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 from .checks import RunContext, StopIn, _rain_at, canonical_place_id, estimate_cost, itinerary, to_hhmm, to_min, trip_legs, validate_plan
 from .geo import travel_leg
 from .hours import open_during
+from .maps import map_path
 from .places import CUISINES, find_places
 from .pricing import ACTIVITY_CATEGORIES, FOOD_CATEGORIES
 from .weather import saturday_forecast
@@ -366,6 +367,7 @@ def build_final_plan(ctx: RunContext, args: SubmitIn, v: dict) -> dict:
         "worth_knowing": _worth_knowing(ctx, rows, home_leg, v),
         "assumptions": ctx.prefs.assumptions,
         "route_url": _route_url(ctx, rows),
+        "map_image": map_path((ctx.center.lat, ctx.center.lon), [(s["lat"], s["lon"]) for s in stops]),
         "warnings": v["errors"] + v["warnings"],
         "validator_issues": len(v["errors"]),
         "data_sources": sorted({s["source"] for s in stops}),

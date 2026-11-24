@@ -95,6 +95,30 @@ function Section({ title, children, tone = "plain" }: { title: string; children:
   );
 }
 
+function RouteMap({ plan }: { plan: Plan }) {
+  const [failed, setFailed] = useState(false);
+  if (!plan.map_image || failed) return null;
+  const order = plan.stops.map((s, i) => `${i + 1} ${s.name}`).join(", ");
+  return (
+    <figure className="overflow-hidden rounded-2xl border border-line bg-surface shadow-sm">
+      {/* Already sized and cached by our API; the Next.js image optimizer would only re-encode it. */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={plan.map_image}
+        alt={`Map of the route from ${plan.start_label}: ${order}`}
+        width={600}
+        height={340}
+        loading="lazy"
+        onError={() => setFailed(true)}
+        className="block h-auto w-full bg-surface-2"
+      />
+      <figcaption className="px-3 py-2 text-[11px] text-muted">
+        🏠 {plan.start_label} · numbered stops in order · dashed lines are straight-line hops, not the road route
+      </figcaption>
+    </figure>
+  );
+}
+
 function Bullets({ items }: { items: string[] }) {
   return (
     <ul className="space-y-1.5 text-sm text-ink/85">
@@ -148,6 +172,8 @@ export default function PlanView({ plan, mode, model, onReset }: { plan: Plan; m
           </p>
         </div>
       </header>
+
+      <RouteMap plan={plan} />
 
       <div>
         {plan.stops.map((s, i) => (

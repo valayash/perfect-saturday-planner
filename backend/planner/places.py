@@ -22,7 +22,7 @@ import httpx2
 from .fallback_data import curated_for
 from .geo import USER_AGENT, haversine_km
 from .models import Location, Place
-from .pricing import category_meta
+from .pricing import category_meta, place_cost
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OVERPASS_TIMEOUT = 1.5  # the public servers are usually at capacity; never let them hold up a plan
@@ -260,7 +260,7 @@ async def _photon(categories: list[str], center: Location, radius_km: float, cou
                 id=f"osm:{props.get('osm_type', 'x').lower()}{props.get('osm_id')}",
                 name=name, category=category, kind=meta["kind"], lat=lat, lon=lon,
                 distance_km=haversine_km(center.lat, center.lon, lat, lon),
-                indoor=meta["indoor"], est_cost=meta["cost"], crowd=meta["crowd"],
+                indoor=meta["indoor"], est_cost=place_cost(name, category, country_code), crowd=meta["crowd"],
                 veg=veg, address=address, note=note,
             ))
         return out
@@ -385,7 +385,7 @@ def _from_geoapify(f: dict, requested: str, center: Location, country_code: str)
         lon=lon,
         distance_km=haversine_km(center.lat, center.lon, lat, lon),
         indoor=meta["indoor"],
-        est_cost=0 if raw.get("fee") == "no" else meta["cost"],
+        est_cost=0 if raw.get("fee") == "no" else place_cost(name, category, country_code),
         crowd=crowd,
         opening_hours=props.get("opening_hours") or raw.get("opening_hours"),
         cuisine=catering.get("cuisine") or raw.get("cuisine"),
@@ -433,7 +433,7 @@ def _from_osm(el: dict, center: Location, country_code: str) -> Place | None:
     if famous and meta["kind"] == "activity" and crowd != "high":
         crowd = "high" if crowd == "medium" else "medium"
     fee = tags.get("fee")
-    cost = 0 if fee == "no" else meta["cost"]
+    cost = 0 if fee == "no" else place_cost(tags.get("name:en") or tags["name"], category, country_code)
     return Place(
         id=f"osm:{el['type'][0]}{el['id']}",
         name=tags.get("name:en") or tags["name"],

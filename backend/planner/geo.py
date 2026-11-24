@@ -201,7 +201,7 @@ def travel_leg(lat1: float, lon1: float, lat2: float, lon2: float, country_code:
     """Estimate a leg between two points: walk if short, otherwise auto/cab."""
     road_km = haversine_km(lat1, lon1, lat2, lon2) * 1.35  # roads are not straight lines
     rates = travel_rates(country_code)
-    if road_km <= 1.2:
+    if road_km <= 1.5:  # about a 20-minute walk
         return {"mode": "walk", "km": round(road_km, 1), "minutes": max(3, round(road_km / 4.5 * 60)), "cost": 0}
     minutes = round(road_km / rates["kmh"] * 60) + rates["pickup_min"]
     cost = rates["base"] + rates["per_km"] * road_km

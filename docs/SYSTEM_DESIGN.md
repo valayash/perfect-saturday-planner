@@ -127,7 +127,7 @@ Parsing is a separate, cheap call on purpose. It keeps clarification logic out o
 | `get_weather` | none | Saturday's hourly rain chance, temperature, sky; sunset | Uses the run's resolved location and time window |
 | `find_activities` | `categories[]` (enum of 20), `radius_km`, `indoor_only`, `near_place_id?` | Up to 12 places: `place_id`, distance, indoor, est. cost, crowd estimate, hours | Category diversity via round-robin selection |
 | `find_food` | `categories[]` (enum of 5), `radius_km`, `max_price_per_person?`, `near_place_id?` | Up to 10 places with veg status (`only`/`yes`/`unverified`) | Hard diet constraints filter results server-side |
-| `estimate_cost` | `stops[]` (place_id, start, duration, spend?) | Per-stop spend, travel legs, total vs budget | Travel: walk if ≤ 1.2 km, else auto/cab (road factor 1.35) |
+| `estimate_cost` | `stops[]` (place_id, start, duration, spend?) | Per-stop spend, travel legs, total vs budget | Travel: walk if ≤ 1.5 km by road (about 20 min), else auto/cab (road factor 1.35) |
 | `validate_plan` | `stops[]` | `errors[]` (must fix), `warnings[]` (fix or explain), totals | See the rules in §6 |
 | `submit_plan` | title, summary, stops with `activity`/`why_it_fits`/`tip`, `tradeoffs[]`, `plan_b` | Accepted, or rejected with errors | Re-validated server-side; rejected up to 2 times |
 
@@ -307,7 +307,9 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 | Safety block | finish reason | Error message, not retryable | Error card |
 | Too slow | 240 s deadline (Vercel limit 300 s) | Rule-based plan | ⚠️ status |
 | Stream stalls in transit | browser watchdog: 12 s without bytes (keep-alives every 3 s) | Long-poll the stored run with `GET /api/plan/{run_id}?after=N`, else one non-streaming re-run | ℹ️ status in the trace |
-| Abuse | per-IP limit, 10 requests / 10 min | HTTP 429 | Error card |
+| Abuse | per-IP limit, 20 requests / 10 min (`PLAN_RATE_LIMIT`) | HTTP 429 | Error card |
+
+**Failure drills:** `"simulate": ["rain"]` replaces the forecast with a 90% chance of rain in every hour of the window (the trace says so); `"simulate": ["llm_down"]` switches every model off, so the run exercises the rule-based parser and planner. The evals use both.
 
 ---
 
@@ -318,7 +320,7 @@ app/components/
   Planner.tsx     state machine: idle → running → clarify | done | error; owns the SSE stream
   InputPanel.tsx  form or free text, presets, interest and constraint chips
   TracePanel.tsx  live steps (icons, timings, source badges, expandable JSON), thoughts, statuses
-  PlanView.tsx    header, cost / time / travel meters, timeline with travel legs, trade-offs, plan B, warnings, cost table
+  PlanView.tsx    header, cost / time / travel meters, route map, timeline with travel legs, trade-offs, plan B, warnings, cost table
 app/lib/
   stream.ts       fetch + ReadableStream SSE parser
   types.ts        shared event and plan types
@@ -354,6 +356,7 @@ The UI is fully client-side and reads the stream with `fetch` and a `ReadableStr
 - **Prompt injection:** user text is wrapped and labelled as data. Tool results are data from public map APIs. The model can only *propose* places from tool results, and server-side validation enforces the rules.
 - **Grounding:** the place registry prevents invented venues and links.
 - **Rate limiting:** per-IP and per-instance. Good enough to protect a demo key; a shared store such as Redis would be needed at scale.
+- **API keys stay server-side:** the route map is fetched by the backend (`GET /api/map`), and the plan only carries a URL signed with a secret derived from the Geoapify key, so the endpoint can't be used to draw arbitrary maps. HTTP client request logging is off, because Geoapify takes its key in the URL, and errors are reported without URLs.
 - **XSS:** React escapes all model text; links are built server-side from place names.
 
 ---
@@ -369,7 +372,7 @@ The UI is fully client-side and reads the stream with `fetch` and a `ReadableStr
 - Event listings (gigs, exhibitions) for the specific Saturday.
 - Shareable plan links (store plans in a key-value store).
 - Persisted rate limiting and caching with Redis.
-- An evaluation set of personas to score plan quality as prompts and models change.
+- Grow the eval set (`evals/run_evals.py`, 10 scenarios today) with LLM-graded checks for the writing itself (e.g. no claims the data doesn't support).
 
 ---
 
@@ -379,7 +382,7 @@ The UI is fully client-side and reads the stream with `fetch` and a `ReadableStr
 vercel.json                      services + routing
 docs/SYSTEM_DESIGN.md            this document
 frontend/                        Next.js app (web service)
-backend/main.py                  FastAPI app: /api/plan (SSE), /api/health
+backend/main.py                  FastAPI app: /api/plan (SSE), /api/plan/{run_id}, /api/map, /api/health
 backend/planner/agent.py         agent loop, model chain, rule-based plan
 backend/planner/parse.py         parse_preferences (Gemini + rules)
 backend/planner/prompts.py       system prompts
@@ -387,8 +390,10 @@ backend/planner/tools.py         tool schemas, execution, final plan assembly
 backend/planner/checks.py        estimate_cost, validate_plan, RunContext
 backend/planner/places.py        Geoapify + Overpass + Photon, curated enrichment/fill, generic
 backend/planner/geo.py           geocoding, distance, travel legs
+backend/planner/maps.py          route map images (Geoapify Static Maps behind signed URLs)
 backend/planner/weather.py       Saturday forecast
 backend/planner/hours.py         OSM opening_hours (Saturday subset)
 backend/planner/pricing.py       category metadata, price and crowd heuristics
 backend/planner/fallback_data.py curated places
+evals/run_evals.py               10 fixed scenarios with automatic checks; writes evals/RESULTS.md
 ```

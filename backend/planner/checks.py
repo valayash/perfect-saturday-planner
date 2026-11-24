@@ -230,7 +230,11 @@ def validate_plan(ctx: RunContext, stops: list[StopIn]) -> dict:
     est = estimate_cost(ctx, stops)
     total, budget = est["total"], p.budget
     if total > budget * 1.15:
-        errors.append(f"Estimated total {total} {p.currency} (incl. travel and a 5% buffer) is well over the {round(budget)} budget.")
+        errors.append(
+            f"Estimated total {total} {p.currency} is well over the {round(budget)} budget: places {est['places_total']}, travel "
+            f"{est['travel_total']} (including the ride home), buffer {est['buffer']}. To cut it, swap paid stops for free ones (parks, "
+            "promenades, galleries, bookshops) and keep stops within ~1 km of each other and of the start, which counts as a free walk."
+        )
     elif total > budget:
         warnings.append(f"Estimated total {total} {p.currency} is slightly over the {round(budget)} budget. Explain the trade-off or trim.")
 

@@ -93,6 +93,7 @@ export type Plan = {
   worth_knowing: string[];
   assumptions: string[];
   route_url: string;
+  map_image?: string | null;
   warnings: string[];
   validator_issues: number;
   data_sources: string[];

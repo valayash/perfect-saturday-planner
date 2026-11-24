@@ -25,9 +25,10 @@ if _env_file.exists():
 
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from planner.agent import run  # noqa: E402
+from planner.maps import parse_points, render  # noqa: E402
 from planner.models import PlanRequest  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +40,7 @@ log = logging.getLogger("planner")
 app = FastAPI(title="Perfect Saturday Planner API")
 
 # Light abuse protection for a public demo. Per-instance only, which is fine for this purpose.
-RATE_LIMIT, RATE_WINDOW = 10, 600
+RATE_LIMIT, RATE_WINDOW = int(os.getenv("PLAN_RATE_LIMIT", "20")), 600
 _hits: dict[str, deque] = defaultdict(deque)
 
 
@@ -143,6 +144,21 @@ async def plan(req: PlanRequest, request: Request, mode: str = "stream"):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/map")
+async def route_map(d: str, sig: str):
+    """The route map image for a plan. Only URLs this server signed work (see planner/maps.py)."""
+    points = parse_points(d, sig)
+    if not points:
+        raise HTTPException(status_code=404, detail="Unknown map")
+    try:
+        image, ctype = await render(points)
+    except Exception as err:  # the upstream URL carries the API key, so log the error type only
+        status = getattr(getattr(err, "response", None), "status_code", None)
+        log.warning("route map failed: %s%s", type(err).__name__, f" {status}" if status else "")
+        raise HTTPException(status_code=502, detail="Map unavailable")
+    return Response(content=image, media_type=ctype, headers={"Cache-Control": "public, max-age=86400, s-maxage=2592000, immutable"})
 
 
 @app.get("/api/plan/{run_id}")

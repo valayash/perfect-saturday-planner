@@ -6,6 +6,8 @@ for India (INR), with a generic table for everywhere else. The UI labels all of 
 
 from __future__ import annotations
 
+import re
+
 # category -> (kind, indoor, crowd on a Saturday, est. cost per person INR, est. cost elsewhere)
 CATEGORIES: dict[str, tuple[str, bool, str, float, float]] = {
     # activities
@@ -50,6 +52,19 @@ def is_india(country_code: str | None) -> bool:
 def category_meta(category: str, country_code: str | None) -> dict:
     kind, indoor, crowd, inr, other = CATEGORIES.get(category, ("activity", False, "medium", 0, 0))
     return {"kind": kind, "indoor": indoor, "crowd": crowd, "cost": inr if is_india(country_code) else other}
+
+
+# Names that usually mean a budget eatery in India (canteens, Udupi and darshini places, dhabas, chai stalls).
+CHEAP_FOOD_NAME = re.compile(r"canteen|udupi|udipi|darshini|bhavan|bhawan|sagar|dhaba|\bchai\b|tea stall|tapri|vada ?pav|irani|thali|"
+                             r"sweets|mithai|juice|chaat|pav bhaji|dosa|idli|tiffin|mess\b|kamat|saravana|adyar ananda|haldiram|bikaner", re.I)
+
+
+def place_cost(name: str, category: str, country_code: str | None) -> float:
+    """Estimated spend per person: the category estimate, lowered for names that signal a budget eatery."""
+    cost = category_meta(category, country_code)["cost"]
+    if is_india(country_code) and category in ("cafe", "restaurant", "fast_food") and CHEAP_FOOD_NAME.search(name):
+        return min(cost, 180)
+    return cost
 
 
 def travel_rates(country_code: str | None) -> dict:

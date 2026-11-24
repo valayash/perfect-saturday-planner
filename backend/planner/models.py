@@ -29,6 +29,8 @@ class PlanRequest(BaseModel):
     free_text: str | None = Field(default=None, max_length=1500)
     clarifications: list[Clarification] = Field(default_factory=list, max_length=4)
     run_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9-]+$")  # lets the browser re-fetch a run
+    # Failure drills for tests (and curious reviewers): force rain over the whole window, or run with every LLM "down".
+    simulate: list[Literal["rain", "llm_down"]] = Field(default_factory=list, max_length=2)
 
 
 # ---------- parsed preferences ----------
