@@ -2,7 +2,7 @@
 
 An AI agent that plans a fun, realistic Saturday from your city, budget, time, mood, interests and constraints. It checks the real forecast, finds real places near you, makes sure the plan is actually doable, explains why each stop fits you, and shows a live trace of everything it did.
 
-**Live:** https://perfect-saturday-planner-nine.vercel.app · **Design doc:** [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) · **Eval results:** [evals/RESULTS.md](evals/RESULTS.md)
+**Live:** https://perfect-saturday-planner-nine.vercel.app · **Design doc (more diagrams):** [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) · **Eval results:** [evals/RESULTS.md](evals/RESULTS.md)
 
 ## Try it
 
@@ -18,15 +18,44 @@ curl -s -X POST 'https://perfect-saturday-planner-nine.vercel.app/api/plan?mode=
 
 ## How it works
 
-```
-Browser (Next.js) ──POST /api/plan──▶ FastAPI (Python) ──▶ agent
-        ◀──── Server-Sent Events: trace steps, model reasoning, final plan ────
+```mermaid
+flowchart LR
+    U(["Browser"]) -->|"POST /api/plan"| V{"Vercel<br/>routing"}
+    V -->|"/*"| W["Next.js UI<br/>form · live trace · plan view"]
+    V -->|"/api/*"| A["FastAPI<br/>SSE stream · run store · rate limit"]
+    A --> AG["Agent<br/>understand → locate → gather → plan"]
+    AG <-->|"chat completions + tools"| GW[("Vercel AI Gateway<br/>gpt-oss-120b · Gemini 2.5 Flash-Lite · Qwen")]
+    AG -->|"places · geocoding · maps"| GEO[("Geoapify<br/>OpenStreetMap data")]
+    AG -->|"forecast · geocoding"| OM[("Open-Meteo")]
+    AG -.->|"no key or down"| PH[("Photon")]
+    A -->|"trace + plan, streamed"| U
 ```
 
 1. **Understand** (LLM): structured JSON output turns the form or free text into typed preferences: time window, energy level, hard vs soft constraints. In chat mode, missing essentials become clarifying questions with quick picks instead of guesses.
 2. **Locate** (code): geocodes the city and neighbourhood.
 3. **Gather** (code, in parallel): Saturday's forecast plus activity and food candidates from live map data, including the nearest match for anything you asked for by name (e.g. the closest bowling alley).
 4. **Plan and revise** (LLM agent with tools): the model plans from the candidates and calls `submit_plan`. The server repairs timing slips itself, validates everything else and sends back what must change. Typically 2–3 LLM calls and about 7 s.
+
+How a request flows through the agent (orange steps use the LLM, blue steps are plain code):
+
+```mermaid
+flowchart LR
+    IN["Form or<br/>free text"] --> P["1 · Understand<br/>LLM: typed preferences"]
+    P -->|"something missing"| Q["Clarifying<br/>questions"]
+    Q -.->|"answers"| P
+    P --> L["2 · Locate<br/>geocode city + area"]
+    L --> G["3 · Gather, in parallel<br/>weather · activities · food"]
+    G --> M["4 · Plan<br/>LLM picks stops,<br/>calls submit_plan"]
+    M --> C{"Server checks<br/>time · travel · budget<br/>hours · diet · rain"}
+    C -->|"errors, up to 2 rounds"| M
+    C -->|"ok"| OUT["Plan · route map ·<br/>trade-offs · plan B"]
+    M -.->|"every model fails"| R["Rule-based plan<br/>same data, no LLM"]
+    R --> OUT
+    classDef llm fill:#fde7d9,stroke:#ea580c,color:#7c2d12
+    classDef code fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    class P,M llm
+    class L,G,C,R code
+```
 
 Why this shape: when the model decided every lookup, a plan took 4–6 LLM calls and 30–40 s. Gathering in code and letting the model plan and fix cut that to about 2 calls. A deterministic validator keeps the plan honest: only places the tools returned, inside your time window and budget, open when you get there.
 

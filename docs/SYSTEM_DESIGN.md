@@ -109,9 +109,30 @@ sequenceDiagram
 
 ### 4.1 Four phases
 
+```mermaid
+flowchart LR
+    IN["Form or<br/>free text"] --> P["1 · Understand<br/>LLM: typed preferences"]
+    P -->|"something missing"| Q["Clarifying<br/>questions"]
+    Q -.->|"answers"| P
+    P --> L["2 · Locate<br/>geocode city + area"]
+    L --> G["3 · Gather, in parallel<br/>weather · activities · food"]
+    G --> M["4 · Plan<br/>LLM picks stops,<br/>calls submit_plan"]
+    M --> C{"Server checks<br/>time · travel · budget<br/>hours · diet · rain"}
+    C -->|"errors, up to 2 rounds"| M
+    C -->|"ok"| OUT["Plan · route map ·<br/>trade-offs · plan B"]
+    M -.->|"every model fails"| R["Rule-based plan<br/>same data, no LLM"]
+    R --> OUT
+    classDef llm fill:#fde7d9,stroke:#ea580c,color:#7c2d12
+    classDef code fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    class P,M llm
+    class L,G,C,R code
+```
+
+Orange steps use the LLM; blue steps are plain code.
+
 | Phase | What happens | LLM? |
 |---|---|---|
-| 1. `parse_preferences` | Normalise the input into a typed `Preferences` object: city, area, budget, currency, minutes, start time, mood, **energy level**, interests, **hard vs soft constraints**, assumptions. Decides whether to ask clarifying questions: in chat mode a code check (`missing_details`) asks for any missing city, budget, time or mood instead of assuming, with quick-pick options. Time windows are clamped to end by 23:00. Specific wishes ("bowling", "beer", "north indian") are kept alongside the model's broader labels. | `gemini-2.5-flash-lite` via AI Gateway (then gpt-oss, then the Gemini API), laid over a rule-based reading |
+| 1. `parse_preferences` | Normalise the input into a typed `Preferences` object: city, area, budget, currency, minutes, start time, mood, **energy level**, interests, **hard vs soft constraints**, assumptions. Decides whether to ask clarifying questions: in chat mode a code check (`missing_details`) asks for any missing city, budget, time or mood instead of assuming, with quick-pick options. Time windows are clamped to end by 23:00. Specific wishes ("bowling", "beer", "north indian") are kept alongside the model's broader labels. | `gemini-2.5-flash-lite` via AI Gateway (then gpt-oss, then rules), laid over a rule-based reading |
 | 2. `resolve_location` | Geocode the city (the most populous match) and neighbourhood (the match nearest the city). An unknown city becomes a clarifying question. | No |
 | 3. Gather | Weather, activity candidates and food candidates, fetched **by code in parallel** (live API data first; curated places only fill gaps). | No |
 | 4. Plan + revise | The model plans from the gathered candidates and calls `submit_plan` directly; the server repairs timing, validates, and returns real problems for one revision. It can still call the search tools for genuine gaps (max 2 searches). | AI Gateway (`gpt-oss-120b` on Cerebras/Groq, then other gateway models), then the rule-based plan |
@@ -138,24 +159,24 @@ Parsing is a separate, cheap call on purpose. It keeps clarification logic out o
 ```mermaid
 stateDiagram-v2
     [*] --> ModelTurn
-    ModelTurn --> RunTools: function calls
+    ModelTurn --> RunTools: tool calls
     ModelTurn --> Nudge: text only
-    Nudge --> ModelTurn: "validate, then submit_plan"
-    RunTools --> ModelTurn: function responses
-    RunTools --> Revalidate: submit_plan
-    Revalidate --> ModelTurn: errors and attempts < 2
-    Revalidate --> Done: accepted (warnings attached)
-    ModelTurn --> SwitchModel: 503/429/timeout before first good turn
-    SwitchModel --> ModelTurn: next model in chain
-    ModelTurn --> Retry: 503/429/timeout mid-run
-    Retry --> ModelTurn: backoff 1.5s, 3s
-    Retry --> Handoff: retries exhausted
-    Handoff --> ModelTurn: next model, fresh history seeded with weather, places, last draft
-    Handoff --> RuleBased: no models left
-    ModelTurn --> RuleBased: API error / turn limit / deadline
+    Nudge --> ModelTurn: finish with submit_plan
+    RunTools --> ModelTurn: search / estimate / validate results
+    RunTools --> ServerCheck: submit_plan
+    ServerCheck --> ModelTurn: errors and fewer than 2 rejections
+    ServerCheck --> Done: accepted, warnings attached
+    ModelTurn --> Retry: busy, 429 or timeout
+    Retry --> ModelTurn: once, after 1 s
+    Retry --> NextModel: still failing
+    NextModel --> ModelTurn: same JSON history
+    NextModel --> RuleBased: no models left
+    ModelTurn --> RuleBased: no credentials, 8 turns or 240 s
     RuleBased --> Done
     Done --> [*]
 ```
+
+The history is plain OpenAI-format JSON, so switching to the next gateway model mid-run keeps everything the run has done. Search results register their places in the run's registry, so `place_id`s stay valid across models and for the rule-based planner.
 
 ### 4.4 Prompting principles
 - **Stable system prompt** (no dates or request data) describes the process: first turn calls weather, activities and food in parallel; 2–4 clustered stops; validate before submitting; plan B is mandatory; unmet interests go in trade-offs.
@@ -202,6 +223,19 @@ An earlier version also called the Gemini API directly as a second provider. It 
 
 The interest rule is a single nudge on purpose: when it stayed an error for two rounds, the model had to juggle it against budget and opening hours, and the evals got slower (up to 6 LLM calls) and worse. Pointing the model at the matching candidates up front (`named_interests` in its first message) fixed the underlying miss instead.
 
+What happens to a `submit_plan` call on the server:
+
+```mermaid
+flowchart TD
+    S["submit_plan<br/>stops · tradeoffs · plan B · text"] --> ID["Match place_ids to the registry<br/>fix a mis-copied OSM type letter or a name"]
+    ID --> SN["snap_schedule<br/>move stops later to fit real travel time, round to 5 min"]
+    SN --> V["validate_plan<br/>errors must be fixed, warnings explained"]
+    V --> NI["Named interests check<br/>covered or explained? error on the first submit, warning after"]
+    NI --> E{"Any errors?"}
+    E -->|"yes, fewer than 2 rejections"| REJ["Reject with the errors and the<br/>travel-adjusted schedule; the model revises"]
+    E -->|"no, or 2 rejections used"| B["build_final_plan<br/>legs · costs · crowds · map URL · visible warnings"]
+```
+
 Costs come from `estimate_cost`: per-category price heuristics (INR for India, a generic table elsewhere) plus distance-based travel. The opening-hours parser understands common OSM forms such as `Mo-Su 09:00-21:00; Su off` and `24/7`. Anything fancier counts as unknown rather than a guess.
 
 ---
@@ -246,11 +280,45 @@ flowchart TD
 - **Open-Meteo geocoding**, with aliases (Bangalore → Bengaluru) and the most populous match.
 - Geocoding results are cached in memory per instance.
 
+How a city and neighbourhood become a starting point:
+
+```mermaid
+flowchart LR
+    C["City name"] --> OMG["Open-Meteo geocoding<br/>aliases, most populous match"]
+    OMG --> HasArea{"Neighbourhood<br/>given?"}
+    HasArea -->|"yes"| AN{"Built-in anchor?<br/>Bandra = Bandra West"}
+    AN -->|"no"| GA["Geoapify geocoding<br/>skip city-level matches"]
+    GA -->|"nothing within 35 km"| OM2["Open-Meteo places<br/>within 35 km"]
+    OM2 -->|"nothing"| PH["Photon"]
+    HasArea -->|"no"| DC["Default centre for a few big cities,<br/>else the city centroid"]
+```
+
 ---
 
 ## 8. Streaming protocol (SSE)
 
 `POST /api/plan` returns `text/event-stream`. The browser sends a `run_id`, and the server keeps every run's events in memory for 15 minutes, decoupled from the HTTP stream. If a stream stalls in transit (seen intermittently on Vercel: the server had sent everything, the browser received nothing), the browser's watchdog notices 12 s of silence (keep-alives go out every 3 s) and switches to long-polling `GET /api/plan/{run_id}?after=N`, short ordinary JSON requests that each return new events as soon as they exist, so the trace keeps updating. If another instance answers (404), the browser falls back to `POST /api/plan?mode=json`, a non-streaming run.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant R as Run store (memory, 15 min)
+    B->>API: POST /api/plan with a run_id
+    API->>R: start the run, independent of the stream
+    loop while the agent works
+        R-->>API: new events
+        API-->>B: data events, keep-alive every 3 s
+    end
+    Note over B: 12 s without a byte means the stream stalled
+    B->>API: GET /api/plan/{run_id}?after=N&wait=8
+    API->>R: events after N
+    API-->>B: new events, next index, done flag
+    alt another instance answered (404)
+        B->>API: POST /api/plan?mode=json
+        API-->>B: every event in one response
+    end
+```
 
 Each event is `data: <json>\n\n`. A `: keep-alive` comment goes out every 3 s of silence so proxies don't close the stream.
 
@@ -277,6 +345,33 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 
 ## 9. Failure handling
 
+Every external dependency has a fallback chain:
+
+```mermaid
+flowchart TB
+    subgraph LLM["Planning model"]
+        direction LR
+        g1["gpt-oss-120b"] -->|"fails"| g2["Gemini 2.5 Flash-Lite"] -->|"fails"| g3["Qwen 3.7 Flash"] -->|"fails"| rb["Rule-based planner"]
+    end
+    subgraph Parse["Reading the request"]
+        direction LR
+        q1["Gemini 2.5 Flash-Lite"] -->|"fails"| q2["gpt-oss-120b"] -->|"fails"| q3["gpt-oss-20b"] -->|"fails"| q4["Rule-based parser"]
+    end
+    subgraph Places["Places"]
+        direction LR
+        p1["Geoapify"] -->|"no key or error"| p2["Photon"] -->|"thin"| p3["Widen radius"] --> p4["Curated places"] -->|"none"| p5["Generic suggestions"]
+    end
+    subgraph Delivery["Delivery"]
+        direction LR
+        s1["SSE stream"] -->|"stalls 12 s"| s2["Long-poll the run store"] -->|"404"| s3["Non-streaming re-run"]
+    end
+    subgraph Weather["Weather"]
+        direction LR
+        w1["Open-Meteo, 1 retry"] -->|"down"| w2["Plan for uncertainty,<br/>plan B covers rain"]
+    end
+    LLM ~~~ Parse ~~~ Places ~~~ Delivery ~~~ Weather
+```
+
 | Failure | Detection | Behaviour | Shown to the user |
 |---|---|---|---|
 | Missing details (chat mode) | `missing_details` on the user's own words | Ask for exactly the missing city / budget / time / mood (quick picks + free text), once each; then re-run with the answers | Question card |
@@ -295,6 +390,21 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 | Abuse | per-IP limit, 20 requests / 10 min (`PLAN_RATE_LIMIT`) | HTTP 429 | Error card |
 
 **Failure drills:** `"simulate": ["rain"]` replaces the forecast with a 90% chance of rain in every hour of the window (the trace says so); `"simulate": ["llm_down"]` switches every model off, so the run exercises the rule-based parser and planner. The evals use both.
+
+### 9.1 Evals
+
+`evals/run_evals.py` runs 10 fixed scenarios against the API (the spec example, a vague request and its answers, simulated rain, a thin-data city, a ₹300 budget, a wish only available far away, a cuisine request, London, and a simulated LLM outage) and checks each result automatically. Results land in `evals/RESULTS.md` and the README.
+
+```mermaid
+flowchart LR
+    S["10 scenarios<br/>request + checks"] --> R["POST /api/plan?mode=json<br/>N times each (--repeat)"]
+    R -.->|"429"| W["wait 75 s"]
+    W -.-> R
+    R --> E["Events: preferences, clarify,<br/>plan, done"]
+    E --> C["Checks: validation · stops · budget · time window ·<br/>map · the scenario's own expectations"]
+    C --> M["Time, LLM calls, tokens"]
+    M --> O["evals/RESULTS.md<br/>and the README table"]
+```
 
 ---
 
@@ -316,6 +426,22 @@ The UI is fully client-side and reads the stream with `fetch` and a `ReadableStr
 ---
 
 ## 11. Deployment
+
+```mermaid
+flowchart LR
+    DEV(["Developer laptop"]) -.->|"vercel deploy --prod"| Vercel
+    U(["Browser"]) --> CDN
+    subgraph Vercel["Vercel project (Hobby, Fluid compute)"]
+        CDN["Edge network<br/>caches /api/map images"] --> RW{"vercel.json<br/>rewrites"}
+        RW -->|"/*"| WEB["Service: web<br/>Next.js, frontend/"]
+        RW -->|"/api/*"| API["Service: api<br/>FastAPI, backend/<br/>300 s limit, agent stops at 240 s"]
+        ENV[["Env: GEOAPIFY_API_KEY<br/>OIDC token, automatic"]] -.-> API
+    end
+    API -->|"OIDC"| GW[("Vercel AI Gateway")]
+    API --> GEO[("Geoapify")]
+    API --> OM[("Open-Meteo")]
+    API -.-> PH[("Photon")]
+```
 
 ```json
 {
@@ -343,6 +469,27 @@ The UI is fully client-side and reads the stream with `fetch` and a `ReadableStr
 - **Rate limiting:** per-IP and per-instance. Good enough to protect a demo key; a shared store such as Redis would be needed at scale.
 - **API keys stay server-side:** the route map is fetched by the backend (`GET /api/map`), and the plan only carries a URL signed with a secret derived from the Geoapify key, so the endpoint can't be used to draw arbitrary maps. HTTP client request logging is off, because Geoapify takes its key in the URL, and errors are reported without URLs.
 - **XSS:** React escapes all model text; links are built server-side from place names.
+
+How the route map keeps the Geoapify key on the server:
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant B as Browser
+    participant API as FastAPI /api/map
+    participant G as Geoapify Static Maps
+    Agent->>Agent: map_path(start, stops) signs the coordinates with HMAC
+    Agent-->>B: plan.map_image = /api/map?d=coordinates&sig=signature
+    B->>API: GET /api/map?d=...&sig=...
+    API->>API: check the signature and 2 to 8 points
+    alt invalid or tampered
+        API-->>B: 404
+    else valid
+        API->>G: static map with numbered markers and a dashed line (key added here)
+        G-->>API: JPEG
+        API-->>B: image, cached by the CDN for 30 days
+    end
+```
 
 ---
 
