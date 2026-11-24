@@ -42,13 +42,17 @@ AREA_ANCHORS: dict[str, dict[str, tuple[float, float]]] = {
     "pune": {"koregaon park": (18.5362, 73.8940), "kalyani nagar": (18.5463, 73.9033), "baner": (18.5590, 73.7868)},
     "gurugram": {"cyber hub": (28.4950, 77.0890), "cyber city": (28.4950, 77.0890)},
 }
-CITY_ANCHOR_KEYS = {"bengaluru": "bengaluru", "bangalore": "bengaluru", "mumbai": "mumbai", "bombay": "mumbai", "delhi": "delhi",
-                    "new delhi": "delhi", "pune": "pune", "gurugram": "gurugram", "gurgaon": "gurugram"}
+# City name (any common spelling) -> the key used for neighbourhood anchors and curated places.
+CITY_KEYS = {"bengaluru": "bengaluru", "bangalore": "bengaluru", "mumbai": "mumbai", "bombay": "mumbai", "delhi": "delhi",
+             "new delhi": "delhi", "pune": "pune", "gurugram": "gurugram", "gurgaon": "gurugram"}
+
+
+def city_key(name: str) -> str | None:
+    return CITY_KEYS.get(name.strip().lower())
 
 
 def _anchor(city: Location, area: str) -> Location | None:
-    key = CITY_ANCHOR_KEYS.get(city.name.strip().lower())
-    hit = AREA_ANCHORS.get(key or "", {}).get(re.sub(r"\s+", " ", area.strip().lower()))
+    hit = AREA_ANCHORS.get(city_key(city.name) or "", {}).get(re.sub(r"\s+", " ", area.strip().lower()))
     if not hit:
         return None
     name = area.strip().title()
@@ -111,21 +115,26 @@ async def resolve_location(city: str, area: str | None, country_code: str | None
     return city_loc, area_loc
 
 
-async def _photon_area(client: httpx2.AsyncClient, area: str, city: Location) -> Location | None:
-    features: list = []
-    for attempt in range(3):  # the public Photon server briefly 503s under bursts
-        try:
-            resp = await client.get(PHOTON_URL, params={"q": area, "lat": city.lat, "lon": city.lon, "limit": 5, "lang": "en"}, timeout=5.0)
-            if resp.status_code in (429, 503) and attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            features = resp.json().get("features", [])
+_photon_slots = asyncio.Semaphore(3)  # the public Photon server 503s on bursts
+
+
+async def photon_search(client: httpx2.AsyncClient, params: dict, attempts: int = 2) -> list[dict]:
+    """GeoJSON features from Photon (OpenStreetMap search), retrying briefly when the server sheds load."""
+    for attempt in range(attempts):
+        async with _photon_slots:
+            resp = await client.get(PHOTON_URL, params=params, timeout=5.0)
+        if resp.status_code not in (429, 503) or attempt == attempts - 1:
             break
-        except (httpx2.HTTPError, ValueError):
-            if attempt == 2:
-                return None
-            await asyncio.sleep(0.5)
+        await asyncio.sleep(0.6 * (attempt + 1))
+    resp.raise_for_status()
+    return resp.json().get("features", [])
+
+
+async def _photon_area(client: httpx2.AsyncClient, area: str, city: Location) -> Location | None:
+    try:
+        features = await photon_search(client, {"q": area, "lat": city.lat, "lon": city.lon, "limit": 5, "lang": "en"}, attempts=3)
+    except (httpx2.HTTPError, ValueError):
+        return None
     for f in features:
         lon, lat = f["geometry"]["coordinates"]
         if haversine_km(city.lat, city.lon, lat, lon) < 35:

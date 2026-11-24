@@ -5,20 +5,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
+from dataclasses import dataclass, field
 
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
 
-from .fallback_data import CITY_KEYS
-from .gateway import PARSE_MODELS, error_text, is_account_problem, request_options
+from .checks import to_min
+from .geo import CITY_KEYS
+from .llm import GATEWAY_PARSE_MODELS, GEMINI_PARSE_MODELS, error_text, is_account_problem, request_options
 from .models import PlanRequest, Preferences
 from .prompts import PARSE_SYSTEM
 
 log = logging.getLogger("planner")
+PARSE_BUDGET_S = 20  # an overloaded model should cost seconds, not a minute
+LATEST_END = 23 * 60  # plans end by 23:00
 HARD_HINTS = re.compile(r"veg|vegan|jain|halal|kosher|allerg|gluten|wheelchair|accessib|kid|child|no alcohol|sober", re.I)
 
 
@@ -172,12 +175,17 @@ def _request_text(req: PlanRequest) -> str:
     return "\n\n".join(parts)
 
 
-PARSE_MODEL = os.getenv("GEMINI_PARSE_MODEL", "gemini-3.5-flash-lite")
-PARSE_BUDGET_S = 20
+@dataclass
+class Parsed:
+    prefs: Preferences
+    source: str  # "gateway", "gemini" or "rules"
+    model: str | None = None
+    tokens: int = 0
+    questions: list[dict] = field(default_factory=list)  # chat mode: the missing details to ask for, with quick picks
 
 
-async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: float, meta: dict) -> Preferences | None:
-    for model in PARSE_MODELS:
+async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: float) -> Parsed | None:
+    for model in GATEWAY_PARSE_MODELS:
         remaining = deadline - time.monotonic()
         if remaining < 3:
             return None
@@ -193,8 +201,7 @@ async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: 
                 timeout=min(remaining, 10),
             )
             prefs = coerce_preferences(resp.choices[0].message.content or "", req)
-            meta.update(model=model, tokens=getattr(resp.usage, "total_tokens", 0) or 0)
-            return prefs
+            return Parsed(prefs, "gateway", model, getattr(resp.usage, "total_tokens", 0) or 0)
         except Exception as err:
             log.warning("parse_preferences failed on gateway %s: %s", model, error_text(err))
             if is_account_problem(err):  # e.g. no card on file: no gateway model will work
@@ -202,22 +209,11 @@ async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: 
     return None
 
 
-async def parse_preferences(
-    client: genai.Client | None, req: PlanRequest, gateway: AsyncOpenAI | None = None, meta: dict | None = None
-) -> tuple[Preferences, str]:
-    """Returns (preferences, source) where source is 'gateway', 'gemini' or 'rules'. Fills meta with model and tokens."""
-    meta = meta if meta is not None else {}
-    fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
-    prefs, source = None, "rules"
-    deadline = time.monotonic() + PARSE_BUDGET_S  # an overloaded model should cost seconds, not a minute
-    if gateway:
-        prefs = await _parse_with_gateway(gateway, req, deadline, meta)
-        source = "gateway" if prefs else "rules"
-    models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client and not prefs else {}  # fast model first, then the chain
-    for model in models:
+async def _parse_with_gemini(client: genai.Client, req: PlanRequest, deadline: float) -> Parsed | None:
+    for model in GEMINI_PARSE_MODELS:
         remaining = deadline - time.monotonic()
         if remaining < 3:
-            break
+            return None
         try:
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
@@ -233,15 +229,24 @@ async def parse_preferences(
                 ),
                 timeout=min(remaining, 12),
             )
-            prefs, source = Preferences.model_validate_json(response.text or ""), "gemini"
-            meta.update(model=model, tokens=getattr(response.usage_metadata, "total_token_count", 0) or 0)
-            break
+            prefs = Preferences.model_validate_json(response.text or "")
+            return Parsed(prefs, "gemini", model, getattr(response.usage_metadata, "total_token_count", 0) or 0)
         except Exception as err:  # overloaded, timed out, bad key, malformed JSON...: try the next model, then rules
             log.warning("parse_preferences failed on %s: %s", model, (str(err) or type(err).__name__)[:200])
-    if prefs is None:
-        prefs = heuristic_preferences(req)
+    return None
 
-    # Guardrails that don't depend on the model behaving.
+
+async def parse_preferences(req: PlanRequest, gateway: AsyncOpenAI | None, gemini: genai.Client | None) -> Parsed:
+    """AI Gateway, then Gemini, then the rule-based reading; then guardrails that don't depend on the model behaving."""
+    deadline = time.monotonic() + PARSE_BUDGET_S
+    parsed = None
+    if gateway:
+        parsed = await _parse_with_gateway(gateway, req, deadline)
+    if gemini and not parsed:
+        parsed = await _parse_with_gemini(gemini, req, deadline)
+    parsed = parsed or Parsed(heuristic_preferences(req), "rules")
+    prefs = parsed.prefs
+
     if req.clarifications and prefs.city:
         prefs.needs_clarification, prefs.clarifying_questions = False, []
     if not prefs.city:
@@ -249,23 +254,20 @@ async def parse_preferences(
         prefs.clarifying_questions = prefs.clarifying_questions[:2] or ["Which city will you be in on Saturday?"]
     prefs.clarifying_questions = prefs.clarifying_questions[:2]
     if req.free_text and not req.city:  # chat mode: ask for missing essentials instead of assuming them
-        asks = missing_details(req, prefs)
-        if asks:
+        parsed.questions = missing_details(req, prefs)
+        if parsed.questions:
             prefs.needs_clarification = True
-            prefs.clarifying_questions = [q["question"] for q in asks]
-            meta["questions"] = asks
+            prefs.clarifying_questions = [q["question"] for q in parsed.questions]
         elif prefs.city:
             prefs.needs_clarification, prefs.clarifying_questions = False, []
-    if not re.fullmatch(r"\d{1,2}:\d{2}", prefs.start_time) or not (6 * 60 <= _to_min(prefs.start_time) <= 22 * 60):
+    if not re.fullmatch(r"\d{1,2}:\d{2}", prefs.start_time) or not (6 * 60 <= to_min(prefs.start_time) <= 22 * 60):
         prefs.start_time = "14:00"
-    room = LATEST_END - _to_min(prefs.start_time)  # plans end by 23:00, whatever the model guessed
+    room = LATEST_END - to_min(prefs.start_time)  # whatever the model guessed
     if prefs.available_minutes > room:
         prefs.assumptions.append(f"Plans end by 23:00, so this one runs {prefs.start_time}–23:00 ({room // 60} h {room % 60:02d} min).")
     prefs.available_minutes = max(45, min(prefs.available_minutes, room, 720))
-    return prefs, source
+    return parsed
 
-
-LATEST_END = 23 * 60
 
 # ---------- chat mode: what's missing? (code, not model judgement, so nothing is silently assumed) ----------
 
@@ -322,8 +324,3 @@ def missing_details(req: PlanRequest, prefs: Preferences) -> list[dict]:
         asks.append({"id": "mood", "question": "What are you in the mood for?",
                      "options": ["Chill: coffee, books, walks", "Foodie: cafés and street food", "Culture: art, museums, music", "Active: games, sports, exploring"]})
     return asks
-
-
-def _to_min(hhmm: str) -> int:
-    h, m = hhmm.split(":")
-    return int(h) * 60 + int(m)

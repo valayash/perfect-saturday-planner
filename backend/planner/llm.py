@@ -1,7 +1,7 @@
-"""Vercel AI Gateway: one OpenAI-compatible endpoint in front of many model providers.
+"""LLM providers and their model chains: Vercel AI Gateway (OpenAI-compatible) first, then the Gemini API.
 
-On Vercel the project's OIDC token authenticates requests (no API key to manage).
-Locally, AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN (from `vercel env pull`) works too.
+On Vercel the project's OIDC token authenticates AI Gateway requests (no API key to manage).
+Locally, AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN (from `vercel env pull`) works too. Gemini reads GEMINI_API_KEY.
 """
 
 from __future__ import annotations
@@ -9,9 +9,8 @@ from __future__ import annotations
 import os
 
 import openai
+from google import genai
 from openai import AsyncOpenAI
-
-from .tools import TOOL_SPECS
 
 GATEWAY_URL = "https://ai-gateway.vercel.sh/v1"
 
@@ -23,21 +22,13 @@ def _models(env: str, default: str) -> list[str]:
 # Defaults are all on AI Gateway's free tier, support tool calling and JSON-schema output, and come from different families.
 GATEWAY_MODELS = _models("AI_GATEWAY_MODELS", "openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash")
 # Parsing is a small extraction job: a small model on fast hardware answers in well under a second.
-PARSE_MODELS = _models("AI_GATEWAY_PARSE_MODELS", "openai/gpt-oss-20b,openai/gpt-oss-120b,google/gemini-2.5-flash-lite")
+GATEWAY_PARSE_MODELS = _models("AI_GATEWAY_PARSE_MODELS", "openai/gpt-oss-20b,openai/gpt-oss-120b,google/gemini-2.5-flash-lite")
 # Open-weights models run on several providers; Cerebras and Groq serve them at hundreds of tokens per second.
 FAST_PROVIDERS = _models("AI_GATEWAY_FAST_PROVIDERS", "cerebras,groq")
 
-OPENAI_TOOLS = [
-    {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
-    for t in TOOL_SPECS
-]
-
-
-def request_options(model: str) -> dict:
-    """Per-model extras: prefer fast providers and low reasoning effort for the gpt-oss family."""
-    if model.startswith("openai/gpt-oss"):
-        return {"reasoning_effort": "low", "extra_body": {"providerOptions": {"gateway": {"order": FAST_PROVIDERS}}}}
-    return {}
+# Gemini API, tried in order when the gateway is unavailable. Parsing tries its fast model first, then the same chain.
+GEMINI_MODELS = _models("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen")
+GEMINI_PARSE_MODELS = list(dict.fromkeys([os.getenv("GEMINI_PARSE_MODEL", "gemini-3.5-flash-lite"), *GEMINI_MODELS]))
 
 
 def gateway_client(oidc_token: str | None) -> AsyncOpenAI | None:
@@ -45,6 +36,20 @@ def gateway_client(oidc_token: str | None) -> AsyncOpenAI | None:
     if not key:
         return None
     return AsyncOpenAI(api_key=key, base_url=GATEWAY_URL, timeout=20.0, max_retries=0)
+
+
+def gemini_client() -> genai.Client | None:
+    try:
+        return genai.Client()  # reads GEMINI_API_KEY
+    except Exception:  # no API key configured
+        return None
+
+
+def request_options(model: str) -> dict:
+    """Per-model extras: prefer fast providers and low reasoning effort for the gpt-oss family."""
+    if model.startswith("openai/gpt-oss"):
+        return {"reasoning_effort": "low", "extra_body": {"providerOptions": {"gateway": {"order": FAST_PROVIDERS}}}}
+    return {}
 
 
 def is_busy(err: Exception) -> bool:

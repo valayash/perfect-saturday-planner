@@ -7,6 +7,7 @@ browser can collect the finished result with GET /api/plan/{run_id} (an ordinary
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -15,17 +16,17 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
 # Local dev convenience: load backend/.env (never committed; on Vercel use project env vars).
+# Must run before the planner is imported: it reads model settings from the environment.
 _env_file = Path(__file__).with_name(".env")
 if _env_file.exists():
     for _line in _env_file.read_text().splitlines():
         if "=" in _line and not _line.lstrip().startswith("#"):
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
-
-from fastapi import FastAPI, Request  # noqa: E402
-from fastapi import HTTPException  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse
 
 from planner.agent import run  # noqa: E402
 from planner.models import PlanRequest  # noqa: E402
@@ -69,7 +70,7 @@ class _Run:
     events: list = field(default_factory=list)
     done: asyncio.Event = field(default_factory=asyncio.Event)
     created: float = field(default_factory=time.monotonic)
-    task: asyncio.Task | None = None
+    task: asyncio.Task | None = None  # held so the running task isn't garbage-collected
 
 
 _runs: dict[str, _Run] = {}
@@ -110,10 +111,8 @@ async def plan(req: PlanRequest, request: Request, mode: str = "stream"):
     r = _start_run(req, request.headers.get("x-vercel-oidc-token"))
 
     if mode == "json":  # non-streaming fallback: one ordinary response with every event
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(r.done.wait(), timeout=RUN_WAIT_S)
-        except asyncio.TimeoutError:
-            pass
         return {"events": r.events, "done": r.done.is_set()}
 
     async def stream():

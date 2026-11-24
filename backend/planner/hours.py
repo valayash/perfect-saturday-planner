@@ -25,7 +25,7 @@ def _days_cover_saturday(days: str) -> bool | None:
             return None
         a = DAYS.index(m.group(1))
         b = DAYS.index(m.group(2)) if m.group(2) else a
-        span = range(a, b + 1) if a <= b else list(range(a, 7)) + list(range(0, b + 1))
+        span = range(a, b + 1) if a <= b else list(range(a, 7)) + list(range(b + 1))
         hit = hit or SAT in span
     return hit
 

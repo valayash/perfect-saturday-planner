@@ -1,9 +1,12 @@
-"""Hand-picked places used when live OpenStreetMap data is unavailable.
+"""Hand-picked, well-known places with hours, prices and veg status. Merged in ahead of live OpenStreetMap
+results, and the fallback when live data is unavailable.
 
 Coordinates are approximate. Costs are per-person estimates in INR.
 """
 
 from __future__ import annotations
+
+from .geo import city_key
 
 # (name, category, lat, lon, extras)
 CURATED: dict[str, list[tuple[str, str, float, float, dict]]] = {
@@ -88,24 +91,15 @@ CURATED: dict[str, list[tuple[str, str, float, float, dict]]] = {
         ("Lodhi Art District", "gallery", 28.5850, 77.2230, {"crowd": "low", "note": "open-air street art across Lodhi Colony"}),
         ("Agrasen ki Baoli", "historic", 28.6262, 77.2251, {"opening_hours": "Mo-Su 07:00-18:00", "crowd": "medium"}),
     ],
-}
-
-CURATED["gurugram"] = [
-    ("CyberHub, DLF Cyber City", "restaurant", 28.4950, 77.0890, {"veg": "yes", "est_cost": 800, "crowd": "high", "note": "dining hub with dozens of restaurants, cafés and bars"}),
-    ("Sector 29 market", "bar", 28.4687, 77.0650, {"est_cost": 900, "crowd": "high", "note": "Gurugram's pub street, next to Leisure Valley"}),
-    ("Galleria Market, DLF Phase IV", "market", 28.4669, 77.0827, {"crowd": "high", "note": "busy food and shopping strip"}),
-    ("Ambience Mall, Gurugram", "mall", 28.5049, 77.0960, {"crowd": "high", "note": "large mall with a food court and an entertainment zone"}),
-    ("Leisure Valley Park", "park", 28.4706, 77.0700, {"crowd": "medium"}),
-]
-
-CITY_KEYS = {
-    "bengaluru": "bengaluru", "bangalore": "bengaluru",
-    "mumbai": "mumbai", "bombay": "mumbai",
-    "delhi": "delhi", "new delhi": "delhi",
-    "gurugram": "gurugram", "gurgaon": "gurugram",
+    "gurugram": [
+        ("CyberHub, DLF Cyber City", "restaurant", 28.4950, 77.0890, {"veg": "yes", "est_cost": 800, "crowd": "high", "note": "dining hub with dozens of restaurants, cafés and bars"}),
+        ("Sector 29 market", "bar", 28.4687, 77.0650, {"est_cost": 900, "crowd": "high", "note": "Gurugram's pub street, next to Leisure Valley"}),
+        ("Galleria Market, DLF Phase IV", "market", 28.4669, 77.0827, {"crowd": "high", "note": "busy food and shopping strip"}),
+        ("Ambience Mall, Gurugram", "mall", 28.5049, 77.0960, {"crowd": "high", "note": "large mall with a food court and an entertainment zone"}),
+        ("Leisure Valley Park", "park", 28.4706, 77.0700, {"crowd": "medium"}),
+    ],
 }
 
 
 def curated_for(city: str) -> list[tuple[str, str, float, float, dict]] | None:
-    key = CITY_KEYS.get(city.strip().lower())
-    return CURATED.get(key) if key else None
+    return CURATED.get(city_key(city) or "")

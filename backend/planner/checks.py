@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 from pydantic import BaseModel, Field
 
@@ -136,7 +137,7 @@ def estimate_cost(ctx: RunContext, stops: list[StopIn]) -> dict:
     }
 
 
-def _rain_at(ctx: RunContext, minute: int) -> int:
+def rain_at(ctx: RunContext, minute: int) -> int:
     if not ctx.weather:
         return 0
     hour = f"{(minute // 60) % 24:02d}:00"
@@ -185,7 +186,7 @@ def validate_plan(ctx: RunContext, stops: list[StopIn]) -> dict:
         warnings.append(f"Plan only uses {used} of {p.available_minutes} available minutes. Fine if intentional (e.g. low energy); say so.")
 
     travel_min = 0
-    for prev, cur in zip(rows, rows[1:]):
+    for prev, cur in pairwise(rows):
         leg = cur["leg"]
         travel_min += leg["minutes"]
         gap = cur["start"] - prev["end"]
@@ -237,7 +238,7 @@ def validate_plan(ctx: RunContext, stops: list[StopIn]) -> dict:
         if ctx.avoid_crowds and r["crowd"] == "high":
             warnings.append(f"{place.name} is likely busy at {to_hhmm(start)} on a Saturday. Pick a quieter time or place, or justify it.")
         if not place.indoor:
-            rain = _rain_at(ctx, start)
+            rain = rain_at(ctx, start)
             if rain >= 60:
                 warnings.append(f"{place.name} is outdoors and rain chance at {to_hhmm(start)} is {rain}%. Make sure plan B covers it.")
             if sunset and end > to_min(sunset) + 20 and place.category in ("park", "garden", "lake", "viewpoint", "historic"):

@@ -50,8 +50,6 @@ export type PlanStop = {
   opening_hours: string | null;
   source: "openstreetmap" | "curated";
   note: string | null;
-  lat: number;
-  lon: number;
   map_url: string;
   travel_from_previous: Leg | null;
 };

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import time
+from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote_plus
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .checks import RunContext, StopIn, _rain_at, estimate_cost, itinerary, to_hhmm, to_min, trip_legs, validate_plan
+from .checks import RunContext, StopIn, estimate_cost, itinerary, rain_at, to_hhmm, to_min, trip_legs, validate_plan
 from .geo import travel_leg
 from .hours import open_during
 from .places import find_places
@@ -130,17 +130,13 @@ TOOL_SPECS = [
 # ---------- execution ----------
 
 
-class ToolOutcome(BaseModel):
+@dataclass
+class ToolOutcome:
     result: dict
     summary: str
     source: str | None = None
     is_error: bool = False
     final_plan: dict | None = None
-
-
-def _register(ctx: RunContext, places: list) -> None:
-    for p in places:
-        ctx.places[p.id] = p
 
 
 def _center_for(ctx: RunContext, place_id: str | None):
@@ -189,8 +185,8 @@ async def run_tool(ctx: RunContext, name: str, raw: Any, submit_attempts: int) -
             max_price=getattr(args, "max_price_per_person", None),
             limit=10 if food else 12,
         )
-        _register(ctx, places)
-        label = notes[0] if notes and "curated" in notes[0] else {"live": "live OpenStreetMap", "curated": "curated", "fallback": "curated", "generic": "generic fallback"}[source]
+        ctx.places.update((x.id, x) for x in places)  # the registry submitted plans are checked against
+        label = "generic fallback" if source == "generic" else notes[0]  # e.g. "2 curated, 10 live OpenStreetMap"
         radius = f"within {args.radius_km:g} km" + (" of your area" if not args.near_place_id else " of the chosen stop")
         return ToolOutcome(
             result={"source": source, "notes": notes, "currency": p.currency, "places": [x.brief() for x in places]},
@@ -279,13 +275,13 @@ def _route_url(ctx: RunContext, rows: list[dict]) -> str:
 CROWD_LABEL = {"low": "Quiet", "medium": "Moderate", "high": "Busy"}
 
 
-def _worth_knowing(ctx: RunContext, rows: list[dict], home_leg: dict | None, v: dict) -> list[str]:
+def _worth_knowing(ctx: RunContext, rows: list[dict], home_leg: dict | None) -> list[str]:
     """Plain-language heads-ups for the person (the validator's warnings are phrased for the model)."""
     notes = []
     for r in rows:
         place = r["place"]
         if not place.indoor:
-            rain = _rain_at(ctx, r["start"])
+            rain = rain_at(ctx, r["start"])
             if rain >= 40:
                 notes.append(f"{place.name} is outdoors; {rain}% chance of rain then.")
         if ctx.vegetarian and place.veg == "unverified":
@@ -327,8 +323,6 @@ def build_final_plan(ctx: RunContext, args: SubmitIn, v: dict) -> dict:
             "opening_hours": place.opening_hours,
             "source": place.source,
             "note": place.note,
-            "lat": place.lat,
-            "lon": place.lon,
             "map_url": _map_url(place.name, area),
             "travel_from_previous": r["leg"] if i else {**start_leg, "from_start": True, "from": ctx.start_label},
         })
@@ -344,7 +338,6 @@ def build_final_plan(ctx: RunContext, args: SubmitIn, v: dict) -> dict:
         "date": weather.get("date"),
         "location": ctx.center.label if ctx.center is not ctx.city else ctx.city.label,
         "start_label": ctx.start_label,
-        "start_point": {"lat": ctx.center.lat, "lon": ctx.center.lon},
         "weather": weather.get("summary"),
         "rain_window": weather.get("rain_window"),
         "energy": ctx.prefs.energy,
@@ -354,11 +347,10 @@ def build_final_plan(ctx: RunContext, args: SubmitIn, v: dict) -> dict:
         "cost": {k: est[k] for k in ("stops", "travel", "places_total", "travel_total", "buffer", "total", "budget", "currency")},
         "tradeoffs": args.tradeoffs,
         "plan_b": {"trigger": args.plan_b.trigger, "suggestion": args.plan_b.suggestion, "places": plan_b_places},
-        "worth_knowing": _worth_knowing(ctx, rows, home_leg, v),
+        "worth_knowing": _worth_knowing(ctx, rows, home_leg),
         "assumptions": ctx.prefs.assumptions,
         "route_url": _route_url(ctx, rows),
         "warnings": v["errors"] + v["warnings"],
         "validator_issues": len(v["errors"]),
         "data_sources": sorted({s["source"] for s in stops}),
-        "generated_at": int(time.time()),
     }

@@ -67,7 +67,7 @@ sequenceDiagram
     participant UI as Next.js UI
     participant API as FastAPI /api/plan
     participant Agent as Agent runtime
-    participant Gemini
+    participant LLM as LLM (AI Gateway, then Gemini)
     participant Data as Open-Meteo / OSM
 
     User->>UI: fill form or describe it, press Plan
@@ -75,11 +75,11 @@ sequenceDiagram
     API-->>UI: 200 text/event-stream (stays open)
     API->>Agent: run(request)
 
-    Agent->>Gemini: parse_preferences (structured JSON)
-    Gemini-->>Agent: Preferences
+    Agent->>LLM: parse_preferences (structured JSON)
+    LLM-->>Agent: Preferences
     Agent-->>UI: step_end, preferences
-    alt input too vague / no city
-        Agent-->>UI: clarify (1-2 questions)
+    alt details missing / no city
+        Agent-->>UI: clarify (questions with quick picks)
         UI->>User: show questions
         User->>UI: answers
         UI->>API: POST /api/plan + clarifications
@@ -88,15 +88,16 @@ sequenceDiagram
     Agent->>Data: geocode city + neighbourhood
     Agent-->>UI: step_end (resolve_location)
 
-    loop until submit_plan accepted (max 10 turns, 240 s)
-        Agent->>Gemini: contents + tools (streamed)
-        Gemini-->>Agent: thoughts + function calls
-        Agent-->>UI: thought_*, step_start (per call)
-        par tool calls run concurrently
-            Agent->>Data: get_weather / find_activities / find_food
-        end
-        Agent-->>UI: step_end (per call)
-        Agent->>Gemini: function responses
+    par gathered by code, concurrently
+        Agent->>Data: get_weather / find_activities / find_food
+    end
+    Agent-->>UI: step_start / step_end (per tool)
+
+    loop until submit_plan accepted (max 8 turns, 240 s)
+        Agent->>LLM: candidates + tools
+        LLM-->>Agent: reasoning + tool calls (usually submit_plan)
+        Agent-->>UI: thought_*, step_start / step_end (per call)
+        Agent->>LLM: tool results, or the validator's errors to fix
     end
 
     Agent-->>UI: plan (+ warnings), done
@@ -158,8 +159,8 @@ stateDiagram-v2
 ```
 
 ### 4.4 Prompting principles
-- **Stable system prompt** (no dates or request data) describes the process: first turn calls weather, activities and food in parallel; 2–4 clustered stops; validate before submitting; plan B is mandatory; unmet interests go in trade-offs.
-- **Per-request facts** go in the first user message: location label, time window, budget, preferences JSON.
+- **Stable system prompt** (no dates or request data) describes the process: plan from the gathered candidates, search again only for genuine gaps; 2–4 clustered stops; call submit_plan directly and fix whatever the server rejects; plan B is mandatory; unmet interests go in trade-offs.
+- **Per-request facts** go in the first user message: location label, time window, budget, preferences JSON, the forecast and the candidate places.
 - **User free text** is wrapped in `<user_text>` tags and treated as data.
 - The model writes `why_it_fits` per stop and must tie it to a named preference (mood, interest, constraint, weather).
 
@@ -217,13 +218,13 @@ Costs come from `estimate_cost`: per-category price heuristics (INR for India, a
 
 ### 7.1 Places provider chain
 
-**Curated first.** For Bengaluru, Mumbai and Delhi, well-known places with hours, per-person prices and veg status are merged in first (within ~1.6× the search radius), then live OSM results fill the rest. Popular neighbourhoods resolve through built-in anchors (e.g. "Bandra" means Bandra West). Live search gets ~3 s when curated data already covers the area (8 s otherwise), Photon results are cached for 30 min, and after a Photon failure live search is skipped for 5 min.
+**Curated first.** For Bengaluru, Mumbai, Delhi and Gurugram, well-known places with hours, per-person prices and veg status are merged in first (within ~1.6× the search radius), then live OSM results fill the rest. Popular neighbourhoods resolve through built-in anchors (e.g. "Bandra" means Bandra West). Live search gets ~3 s when curated data already covers the area (8 s otherwise), Photon results are cached for 30 min, and after a Photon failure live search is skipped for 5 min.
 
 
 ```mermaid
 flowchart TD
     Q["find_activities / find_food"] --> PAR{{"query in parallel"}}
-    PAR --> OV["Overpass<br/>5 s timeout<br/>rich tags: hours, diet, cuisine"]
+    PAR --> OV["Overpass<br/>1.5 s timeout<br/>rich tags: hours, diet, cuisine"]
     PAR --> PH["Photon<br/>≤ 3 concurrent, retry on 503<br/>names, addresses, coordinates"]
     OV -- "results" --> PICK["prefer Overpass"]
     OV -- "fail → 10 min cooldown" --> PH2["use Photon results"]
@@ -232,7 +233,7 @@ flowchart TD
     PH2 --> F
     F -- "≥ 3 results" --> OUT["return 'live'"]
     F -- "< 3 results" --> WIDEN["widen radius ×2 once"] --> F
-    F -- "nothing" --> CUR["curated places<br/>Bengaluru / Mumbai / Delhi"] --> OUT2["return 'fallback'"]
+    F -- "nothing" --> CUR["curated places<br/>Bengaluru / Mumbai / Delhi / Gurugram"] --> OUT2["return 'curated'"]
     CUR -- "unknown city" --> GEN["honest generic suggestions"] --> OUT3["return 'generic'"]
 ```
 
@@ -256,7 +257,7 @@ Each event is `data: <json>\n\n`. A `: keep-alive` comment goes out every 3 s of
 | Event | Payload | UI use |
 |---|---|---|
 | `step_start` | `id, name, label, input` | New trace row with a spinner |
-| `step_end` | `id, ok, summary, source, ms, output` | Tick or cross, timing, `live`/`fallback`/`gemini`/`rules` badge; expandable input and output JSON |
+| `step_end` | `id, ok, summary, source, ms, output` | Tick or cross, timing, `live`/`curated`/`generic`/`gateway`/`gemini`/`rules` badge; expandable input and output JSON |
 | `thought_start` / `thought_delta` | `block, kind` / `block, text` | "Thinking with <model>…" and any thought summaries, streamed |
 | `status` | `message, tone` | Model switches, retries, fallback notices |
 | `preferences` | parsed `Preferences` | "What I understood" chips |
@@ -285,10 +286,10 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 | Gemini parse fails | any exception or 12 s per-model timeout (20 s total budget) | Next model, then the rule-based parser (reads form, free text and answers) | `RULES` badge |
 | Gemini unavailable (bad key, outage) | API error | Rule-based plan using the same tools and validator | "Rule-based backup plan" label |
 | Overpass at capacity | HTTP error or timeout | Photon results; Overpass skipped for 10 min | `live` (Photon) |
-| No live places | empty results | Widen radius, then curated, then generic | `fallback` / `generic` badge, "curated data" pill |
+| No live places | empty results | Widen radius, then curated, then generic | `curated` / `generic` badge, "Curated" pill on the stop |
 | Weather API down | exception | Plan for uncertainty; plan B covers rain | Trace summary |
 | Invalid tool input from the model | Pydantic validation | Error returned as the function response; the model retries | ✕ in the trace |
-| Plan breaks rules | `validate_plan` errors | Sent back to the model (up to 2 rejections), then accepted with visible warnings | "Heads-up" box |
+| Plan breaks rules | `validate_plan` errors | Sent back to the model (up to 2 rejections), then accepted | "Worth knowing" box; validator-issue count under the plan |
 | Safety block | finish reason | Error message, not retryable | Error card |
 | Too slow | 240 s deadline (Vercel limit 300 s) | Rule-based plan | ⚠️ status |
 | Stream stalls in transit | browser watchdog: 12 s without bytes (keep-alives every 3 s) | Long-poll the stored run with `GET /api/plan/{run_id}?after=N`, else one non-streaming re-run | ℹ️ status in the trace |
@@ -366,7 +367,8 @@ docs/SYSTEM_DESIGN.md            this document
 frontend/                        Next.js app (web service)
 backend/main.py                  FastAPI app: /api/plan (SSE), /api/health
 backend/planner/agent.py         agent loop, model chain, rule-based plan
-backend/planner/parse.py         parse_preferences (Gemini + rules)
+backend/planner/llm.py           AI Gateway and Gemini clients, model chains, error classification
+backend/planner/parse.py         parse_preferences (AI Gateway / Gemini + rules)
 backend/planner/prompts.py       system prompts
 backend/planner/tools.py         tool schemas, execution, final plan assembly
 backend/planner/checks.py        estimate_cost, validate_plan, RunContext

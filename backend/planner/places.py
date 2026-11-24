@@ -16,20 +16,18 @@ import time
 import httpx2
 
 from .fallback_data import curated_for
-from .geo import USER_AGENT, haversine_km
+from .geo import USER_AGENT, haversine_km, photon_search
 from .models import Location, Place
 from .pricing import category_meta
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OVERPASS_TIMEOUT = 1.5  # the public servers are usually at capacity; never let them hold up a plan
 OVERPASS_COOLDOWN = 600  # after a failure, skip Overpass for 10 minutes
-PHOTON_URL = "https://photon.komoot.io/api/"
 _overpass_down_until = 0.0
-_photon_slots = asyncio.Semaphore(3)
+PHOTON_COOLDOWN = 300  # after Photon fails or is slow, skip live search for 5 minutes when curated data exists
 _photon_down_until = 0.0
-PHOTON_COOLDOWN = 300
-_photon_cache: dict[tuple, tuple[float, list]] = {}
 PHOTON_CACHE_S = 1800
+_photon_cache: dict[tuple, tuple[float, list]] = {}
 
 # category -> [(search text, osm_tag filter)] for Photon
 PHOTON_QUERIES: dict[str, list[tuple[str, str]]] = {
@@ -160,6 +158,7 @@ def _veg_status(tags: dict) -> str:
 
 
 async def _photon(categories: list[str], center: Location, radius_km: float, country_code: str, vegetarian: bool) -> list[Place]:
+    global _photon_down_until
     dlat = radius_km / 111.0
     dlon = radius_km / (111.0 * max(0.2, math.cos(math.radians(center.lat))))
     bbox = f"{center.lon - dlon:.5f},{center.lat - dlat:.5f},{center.lon + dlon:.5f},{center.lat + dlat:.5f}"
@@ -171,14 +170,7 @@ async def _photon(categories: list[str], center: Location, radius_km: float, cou
         if cached and time.monotonic() - cached[0] < PHOTON_CACHE_S:
             features = cached[1]
         else:
-            for attempt in range(2):
-                async with _photon_slots:  # the public server 503s on bursts
-                    resp = await client.get(PHOTON_URL, params=params, timeout=5.0)
-                if resp.status_code not in (429, 503) or attempt:
-                    break
-                await asyncio.sleep(0.6)
-            resp.raise_for_status()
-            features = resp.json().get("features", [])
+            features = await photon_search(client, params)
             _photon_cache[key] = (time.monotonic(), features)
         out = []
         for f in features:
@@ -208,6 +200,7 @@ async def _photon(categories: list[str], center: Location, radius_km: float, cou
         results = await asyncio.gather(*(one(client, *q) for q in queries), return_exceptions=True)
     places = [p for r in results if isinstance(r, list) for p in r]
     if not places and all(isinstance(r, Exception) for r in results):
+        _photon_down_until = time.monotonic() + PHOTON_COOLDOWN
         raise PlacesUnavailable("Photon is not responding.")
     return places
 
@@ -225,6 +218,15 @@ async def _live(categories: list[str], center: Location, radius_km: float, count
     except PlacesUnavailable:
         pass
     return await photon, "OpenStreetMap (Photon)"
+
+
+async def _live_within(budget_s: float, *args) -> tuple[list[Place], str]:
+    global _photon_down_until
+    try:
+        return await asyncio.wait_for(_live(*args), timeout=budget_s)
+    except TimeoutError:
+        _photon_down_until = time.monotonic() + PHOTON_COOLDOWN
+        raise PlacesUnavailable(f"Live search took over {budget_s:g}s; using what's on hand.") from None
 
 
 def _from_osm(el: dict, center: Location, country_code: str) -> Place | None:
@@ -374,31 +376,21 @@ async def find_places(
     curated = _filter(curated_places(city, center, kind, categories, strict=True), indoor_only, vegetarian, max_price)
     curated = [p for p in curated if p.distance_km <= max(radius_km * 1.6, 6)]  # stay in the user's part of town
 
-    global _photon_down_until
     live: list[Place] = []
     live_budget = 3.0 if len(curated) >= 5 else 8.0  # curated data already covers this area: don't wait long for live
     try:
         if time.monotonic() < _photon_down_until and curated:
             raise PlacesUnavailable("Live map search is struggling right now; using curated places.")
-        try:
-            raw, provider = await asyncio.wait_for(_live(categories, center, radius_km, country_code, vegetarian), timeout=live_budget)
-        except asyncio.TimeoutError:
-            _photon_down_until = time.monotonic() + PHOTON_COOLDOWN
-            raise PlacesUnavailable(f"Live search took over {live_budget:g}s; using what's on hand.")
+        raw, provider = await _live_within(live_budget, categories, center, radius_km, country_code, vegetarian)
         live = _filter(raw, indoor_only, vegetarian, max_price)
         if not live and not curated and radius_km < 12:
             wider = min(12, radius_km * 2)
-            notes.append(f"Only {len(live) + len(curated)} matches within {radius_km:g} km, widened the search to {wider:g} km.")
-            try:
-                raw, provider = await asyncio.wait_for(_live(categories, center, wider, country_code, vegetarian), timeout=live_budget)
-                live = _filter(raw, indoor_only, vegetarian, max_price)
-            except asyncio.TimeoutError:
-                pass
+            notes.append(f"No matches within {radius_km:g} km, widened the search to {wider:g} km.")
+            raw, provider = await _live_within(live_budget, categories, center, wider, country_code, vegetarian)
+            live = _filter(raw, indoor_only, vegetarian, max_price)
         if live:
             notes.append(f"Live data from {provider}.")
     except PlacesUnavailable as err:
-        if "Photon" in str(err):
-            _photon_down_until = time.monotonic() + PHOTON_COOLDOWN
         notes.append(str(err))
 
     curated_names = {_norm(p.name) for p in curated}

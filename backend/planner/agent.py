@@ -12,34 +12,36 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import AsyncIterator
 
 from google import genai
 from google.genai import errors, types
 from openai import AsyncOpenAI
 
 from .checks import RunContext, StopIn, to_hhmm, to_min, validate_plan
-from .gateway import GATEWAY_MODELS, OPENAI_TOOLS, error_text, gateway_client, is_account_problem, is_busy, request_options
-from .geo import ALIASES, GeocodeError, haversine_km, resolve_location, travel_leg
+from .geo import GeocodeError, haversine_km, resolve_location, travel_leg
+from .llm import GATEWAY_MODELS, GEMINI_MODELS, error_text, gateway_client, gemini_client, is_account_problem, is_busy, request_options
 from .models import PlanRequest
 from .parse import parse_preferences
 from .prompts import AGENT_SYSTEM
 from .tools import TOOL_SPECS, FinalStop, PlanB, SubmitIn, build_final_plan, run_tool
 
-# Gemini models, tried in order; the run switches to the next one if a model is overloaded.
-MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
 MID_RUN_RETRIES = 2  # then hand off to the next model (Gemini history is tied to one model's thought signatures)
 THINKING_LEVEL = {"gemini-4-hydrogen": "medium", "gemini-4-neon": "medium"}  # others: "low"
 MAX_TURNS = 8
 DEADLINE_S = 240  # Vercel Hobby functions stop at 300s
 TURN_TIMEOUT_MS = 20_000
 GATEWAY_TURN_TIMEOUT_S = 45
+MAX_MODEL_SEARCHES = 2  # the data is pre-gathered; extra searches are for genuine gaps, not habit
 NUDGE = "Please finish now by calling submit_plan with your plan."
 
+OPENAI_TOOLS = [
+    {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
+    for t in TOOL_SPECS
+]
 GEMINI_TOOLS = types.Tool(function_declarations=[
     types.FunctionDeclaration(name=t["name"], description=t["description"], parameters_json_schema=t["parameters"])
     for t in TOOL_SPECS
@@ -111,13 +113,13 @@ def _user_message(ctx: RunContext) -> str:
 
 def _seed_message(ctx: RunContext, last_draft: dict | None) -> str:
     """Everything gathered so far, so the model can plan straight away (place_ids live in ctx.places)."""
-    weather = {k: v for k, v in (ctx.weather or {}).items() if k != "hourly"} | {"hourly": (ctx.weather or {}).get("hourly", [])}
+
     def brief(p):
         leg = travel_leg(ctx.center.lat, ctx.center.lon, p.lat, p.lon, ctx.city.country_code)
         return p.brief() | {"minutes_from_start": leg["minutes"]}
 
     data = {
-        "weather": weather if ctx.weather else "unavailable: plan for uncertain weather",
+        "weather": ctx.weather or "unavailable: plan for uncertain weather",
         "activity_candidates": [brief(p) for p in ctx.places.values() if p.kind == "activity"][:20],
         "food_candidates": [brief(p) for p in ctx.places.values() if p.kind == "food"][:16],
         "travel_rule_of_thumb": "between two stops allow ~6 min plus ~3-4 min per km by auto/cab; walking under ~1 km",
@@ -130,9 +132,6 @@ def _seed_message(ctx: RunContext, last_draft: dict | None) -> str:
         "Plan from these place_ids and call submit_plan directly; the server validates it and tells you anything to fix.\n"
         + json.dumps(data, ensure_ascii=False)
     )
-
-
-MAX_MODEL_SEARCHES = 2  # the data is pre-gathered; extra searches are for genuine gaps, not habit
 
 
 async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: list[tuple[str | None, str, dict]], actor: str = "code",
@@ -150,7 +149,7 @@ async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: li
         yield ev
     outcomes = await asyncio.gather(*(run_tool(ctx, name, args, state.submit_attempts) for _, name, args, _, _ in starts))
     state.results = list(refused)
-    for (call_id, name, args, sid, t0), out in zip(starts, outcomes):
+    for (call_id, name, args, sid, t0), out in zip(starts, outcomes, strict=True):
         yield steps.end(sid, t0, out.summary, ok=not out.is_error, source=out.source, output=out.result)
         state.results.append((call_id, name, {"error": out.result} if out.is_error else out.result))
         if name in ("validate_plan", "estimate_cost", "submit_plan") and not out.final_plan:
@@ -163,7 +162,7 @@ async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: li
 def _gather_calls(ctx: RunContext) -> list[tuple[None, str, dict]]:
     """The data every plan needs, fetched by code in parallel before the model is involved."""
     p = ctx.prefs
-    interest_cats = _categories_for(p.interests, rainy=False)
+    interest_cats = _categories_for(p.interests)
     indoor = ["arts_centre", "gallery", "museum", "bookstore", "live_music"]
     activity_cats = (interest_cats + [c for c in indoor if c not in interest_cats])[:6]
     food_cats = _food_categories(p)
@@ -179,26 +178,21 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     steps = _Steps()
     state = LoopState(started=started)
     gateway = gateway_client(oidc_token)
-    try:
-        gemini: genai.Client | None = genai.Client()  # reads GEMINI_API_KEY
-    except Exception:  # no API key configured
-        gemini = None
+    gemini = gemini_client()
 
     # 1. understand preferences (LLM)
     ev, sid, t0 = steps.start("parse_preferences", "Understanding your request", req.model_dump(exclude={"run_id"}, exclude_none=True, exclude_defaults=True), actor="llm")
     yield ev
-    meta: dict = {}
-    # Geocode the city from the form while the model reads the request; reused if the parse agrees on the city.
-    early_geo = asyncio.create_task(resolve_location(req.city, req.area, None)) if req.city else None
-    prefs, parse_source = await parse_preferences(gemini, req, gateway, meta)
-    if meta.get("model"):
+    parsed = await parse_preferences(req, gateway, gemini)
+    prefs = parsed.prefs
+    if parsed.model:
         state.llm_calls += 1
-        state.tokens += meta.get("tokens", 0)
-    who = f"{meta['model']} extracted preferences" if meta.get("model") else "rule-based parse (AI unavailable)"
-    yield steps.end(sid, t0, f"{who}: {prefs.city or 'no city'} · {prefs.start_time}, {prefs.available_minutes} min · {round(prefs.budget)} {prefs.currency} · {prefs.energy} energy", source=parse_source, output=prefs.model_dump())
-    yield _ev("preferences", preferences=prefs.model_dump(), source=parse_source)
+        state.tokens += parsed.tokens
+    who = f"{parsed.model} extracted preferences" if parsed.model else "rule-based parse (AI unavailable)"
+    yield steps.end(sid, t0, f"{who}: {prefs.city or 'no city'} · {prefs.start_time}, {prefs.available_minutes} min · {round(prefs.budget)} {prefs.currency} · {prefs.energy} energy", source=parsed.source, output=prefs.model_dump())
+    yield _ev("preferences", preferences=prefs.model_dump(), source=parsed.source)
     if prefs.needs_clarification:
-        asks = meta.get("questions") or [{"id": f"q{i}", "question": q, "options": []} for i, q in enumerate(prefs.clarifying_questions)]
+        asks = parsed.questions or [{"id": f"q{i}", "question": q, "options": []} for i, q in enumerate(prefs.clarifying_questions)]
         missing = [q["id"] for q in asks if q["id"] in ("city", "budget", "time", "mood")]
         summary = ("Missing " + ", ".join({"mood": "what you're in the mood for"}.get(m, m) for m in missing) + ".") if missing else "Your request was a bit open-ended."
         yield _ev("clarify", questions=asks, summary=summary, assumptions=prefs.assumptions)
@@ -207,11 +201,8 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     # 2. resolve the city / neighbourhood (code)
     ev, sid, t0 = steps.start("resolve_location", "Finding your area on the map", {"city": prefs.city, "area": prefs.area})
     yield ev
-    same_place = early_geo and (prefs.area or "") == (req.area or "") and _same_city(prefs.city, req.city)
-    if early_geo and not same_place:
-        early_geo.cancel()
     try:
-        city, area = await (early_geo if same_place else resolve_location(prefs.city or "", prefs.area, prefs.country_code))
+        city, area = await resolve_location(prefs.city or "", prefs.area, prefs.country_code)
     except GeocodeError as err:
         yield steps.end(sid, t0, str(err), ok=False)
         yield _ev("clarify", questions=[f"I couldn't find '{prefs.city}'. Which city (and country) do you mean?"], assumptions=[])
@@ -250,11 +241,6 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     reason = state.failure or ("The agent ran out of time before finishing" if state.out_of_time() else "The AI model is unavailable right now")
     async for e in _rule_based_plan(ctx, steps, reason=reason):
         yield e
-
-
-def _same_city(a: str | None, b: str | None) -> bool:
-    norm = lambda x: ALIASES.get((x or "").strip().lower(), (x or "").strip()).lower()  # noqa: E731
-    return bool(a and b) and norm(a) == norm(b)
 
 
 def _llm_step_label(turn: int, state: LoopState) -> tuple[str, str]:
@@ -344,7 +330,7 @@ async def _gemini_loop(client: genai.Client, ctx: RunContext, steps: _Steps, sta
     contents: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=_seed_message(ctx, state.last_draft))])]
     model_idx, good_turns, retries, turns = 0, 0, 0, 0
     while turns < MAX_TURNS and not state.out_of_time():
-        model = MODELS[model_idx]
+        model = GEMINI_MODELS[model_idx]
         name, label = _llm_step_label(turns, state)
         ev, sid, t0 = steps.start(name, label, {"model": model, "via": "Gemini API"}, actor="llm")
         yield ev
@@ -358,14 +344,14 @@ async def _gemini_loop(client: genai.Client, ctx: RunContext, steps: _Steps, sta
                     parts, finish = item
         except ModelBusy as err:
             yield steps.end(sid, t0, str(err), ok=False, source="gemini")
-            if good_turns == 0 and model_idx + 1 < len(MODELS):
+            if good_turns == 0 and model_idx + 1 < len(GEMINI_MODELS):
                 model_idx += 1
                 continue
             if retries < MID_RUN_RETRIES:
                 retries += 1
                 await asyncio.sleep(1.5 * retries)
                 continue
-            if model_idx + 1 < len(MODELS):  # hand off: fresh conversation for the next model, seeded with the work so far
+            if model_idx + 1 < len(GEMINI_MODELS):  # hand off: fresh conversation for the next model, seeded with the work so far
                 model_idx, retries, good_turns = model_idx + 1, 0, 0
                 contents = [types.Content(role="user", parts=[types.Part(text=_seed_message(ctx, state.last_draft))])]
                 continue
@@ -444,7 +430,7 @@ async def _model_turn(client: genai.Client, model: str, contents: list[types.Con
         if err.code == 429:
             raise ModelBusy(f"{model} is rate-limited (429)") from err
         raise
-    except (asyncio.TimeoutError, TimeoutError) as err:
+    except TimeoutError as err:
         raise ModelBusy(f"{model} timed out") from err
     except Exception as err:
         if "timeout" in type(err).__name__.lower():
@@ -456,32 +442,10 @@ async def _model_turn(client: genai.Client, model: str, contents: list[types.Con
 
 
 async def _rule_based_plan(ctx: RunContext, steps: _Steps, reason: str) -> AsyncIterator[dict]:
-    """Graceful degradation: build a simple plan with the same tools but no LLM."""
+    """Graceful degradation: a simple plan from the data already gathered, with no LLM."""
     yield _ev("status", message=f"{reason}. Building a simpler rule-based plan from the same data.")
     p = ctx.prefs
     rainy = bool(ctx.weather and ctx.weather.get("max_rain_chance_in_window", 0) >= 60)
-    have = {"get_weather": ctx.weather is not None, "find_activities": any(x.kind == "activity" for x in ctx.places.values()),
-            "find_food": any(x.kind == "food" for x in ctx.places.values())}
-    for name, args in (
-        ("get_weather", {}),
-        ("find_activities", None),
-        ("find_food", None),
-    ):
-        if have[name]:
-            continue
-        if args is None:
-            if name == "find_activities":
-                cats = _categories_for(p.interests, rainy)
-                args = {"categories": cats, "radius_km": 4, "indoor_only": rainy}
-            else:
-                args = {"categories": ["cafe", "restaurant"], "radius_km": 3, "max_price_per_person": p.budget * 0.5}
-        ev, sid, t0 = steps.start(name, LABELS[name], args)
-        yield ev
-        out = await run_tool(ctx, name, args, 0)
-        yield steps.end(sid, t0, out.summary, ok=not out.is_error, source=out.source, output=out.result)
-        if name == "get_weather" and ctx.weather:
-            rainy = ctx.weather.get("max_rain_chance_in_window", 0) >= 60
-
     activities = [x for x in ctx.places.values() if x.kind == "activity" and not (ctx.avoid_crowds and x.crowd == "high")]
     foods = [x for x in ctx.places.values() if x.kind == "food" and x.veg != "no"]
     if rainy:
@@ -544,14 +508,9 @@ INTEREST_CATEGORIES: list[tuple[tuple[str, ...], str]] = [
 ]
 
 
-def _categories_for(interests: list[str], rainy: bool) -> list[str]:
+def _categories_for(interests: list[str]) -> list[str]:
     text = " ".join(interests).lower()
-    cats = []
-    for words, cat in INTEREST_CATEGORIES:
-        if any(w in text for w in words) and cat not in cats:
-            cats.append(cat)
-    if rainy:
-        cats = [c for c in cats if c not in ("park", "lake", "garden", "viewpoint")] + ["bookstore", "museum"]
+    cats = list(dict.fromkeys(cat for words, cat in INTEREST_CATEGORIES if any(w in text for w in words)))
     return (cats or ["park", "bookstore", "gallery"])[:6]
 
 

@@ -34,7 +34,7 @@ The model can only use places the search tools returned (unknown `place_id`s are
 
 ## Real data, scrappily
 
-- **Places:** OpenStreetMap through two free, keyless APIs queried in parallel: **Overpass** (rich tags: opening hours, `diet:vegetarian`, cuisine) and **Photon** (fast OSM search). The public Overpass servers are often at capacity, so Photon usually answers; Overpass wins when it responds within 5s.
+- **Places:** OpenStreetMap through two free, keyless APIs queried in parallel: **Overpass** (rich tags: opening hours, `diet:vegetarian`, cuisine) and **Photon** (fast OSM search). The public Overpass servers are often at capacity, so Photon usually answers; Overpass wins when it responds within 1.5 s.
 - **Weather + geocoding:** Open-Meteo.
 - **Prices and crowd levels** aren't in OSM, so they're category heuristics (tuned for India, generic elsewhere) and labelled "est." everywhere.
 
@@ -45,7 +45,7 @@ The model can only use places the search tools returned (unknown `place_id`s are
 | Missing details in chat mode (city, budget, time, mood) | One question card listing exactly what's missing, with quick picks; each detail is asked once, then it plans |
 | Unknown city | Asks which city you mean |
 | Overpass overloaded | Photon answers instead (trace shows the source) |
-| Both live sources down, or no matches | Widens the radius once, then curated places (Bengaluru, Mumbai, Delhi), then honest generic suggestions |
+| Both live sources down, or no matches | Widens the radius once, then curated places (Bengaluru, Mumbai, Delhi, Gurugram), then honest generic suggestions |
 | Rain forecast | Indoor picks; plan B always included |
 | Plan breaks rules | Validator errors go back to the model to fix; warnings must be explained as trade-offs |
 | A model is overloaded (503) or rate-limited (429) | Next model in the chain: AI Gateway models first (`gpt-oss-120b` → `gemini-2.5-flash-lite` → `qwen3.7-flash`, all on the free tier), then the Gemini API models; the work so far is handed over |
@@ -73,7 +73,7 @@ npm run dev
 
 LLM providers (any one is enough; the chain uses whatever is configured): `AI_GATEWAY_API_KEY` (local only; on Vercel the project's OIDC token is used automatically) and/or `GEMINI_API_KEY`.
 
-Optional env vars: `AI_GATEWAY_MODELS` (default `openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash`), `GEMINI_MODELS` (comma-separated fallback chain, default `gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen`) and `GEMINI_PARSE_MODEL` (default `gemini-3.5-flash-lite`).
+Optional env vars (all read in `backend/planner/llm.py`): `AI_GATEWAY_MODELS` (default `openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash`), `AI_GATEWAY_PARSE_MODELS` (default `openai/gpt-oss-20b,openai/gpt-oss-120b,google/gemini-2.5-flash-lite`), `AI_GATEWAY_FAST_PROVIDERS` (default `cerebras,groq`), `GEMINI_MODELS` (comma-separated fallback chain, default `gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen`) and `GEMINI_PARSE_MODEL` (default `gemini-3.5-flash-lite`).
 
 ## Deploy (Vercel)
 
@@ -93,7 +93,7 @@ frontend/app/            Next.js UI: form, live trace, plan view
 backend/main.py          FastAPI app: SSE endpoint, keep-alives, simple rate limit
 backend/planner/
   agent.py               provider chain: AI Gateway loop → Gemini loop → rule-based plan
-  gateway.py             Vercel AI Gateway client (OpenAI-compatible, OIDC or key auth)
+  llm.py                 AI Gateway (OpenAI-compatible, OIDC or key auth) and Gemini clients, model chains
   parse.py               parse_preferences (structured output + rules fallback)
   tools.py               tool schemas, execution, final plan assembly
   places.py              Overpass + Photon + curated/generic fallbacks
