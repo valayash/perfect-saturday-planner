@@ -54,7 +54,7 @@ class FinalStop(StopIn):
 
 class PlanB(BaseModel):
     trigger: str = Field(description="When to switch, e.g. 'If it rains' or 'If the café is packed'.")
-    suggestion: str = Field(description="What to do instead.")
+    suggestion: str = Field(description="What to do instead. Describe places only as the data shows them; never invent amenities or events.")
     place_ids: list[str] = Field(default_factory=list, description="Real place_ids from searches used by plan B, if any.")
 
 

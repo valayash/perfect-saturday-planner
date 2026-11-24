@@ -31,6 +31,9 @@ from planner.agent import run  # noqa: E402
 from planner.models import PlanRequest  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
+# The HTTP client logs every request URL at INFO, and Geoapify takes its API key in the URL: keep keys out of the logs.
+for noisy in ("httpx2", "httpcore2", "httpx", "httpcore"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("planner")
 
 app = FastAPI(title="Perfect Saturday Planner API")

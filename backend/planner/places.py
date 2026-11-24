@@ -339,8 +339,15 @@ async def _geoapify(categories: list[str], center: Location, radius_km: float, c
     if errors and not places:
         if any("rejected the API key" in str(e) for e in errors):
             _geoapify_down_until = time.monotonic() + GEOAPIFY_COOLDOWN
-        raise PlacesUnavailable(f"Geoapify unavailable ({type(errors[0]).__name__}: {str(errors[0])[:80]}).")
+        raise PlacesUnavailable(f"Geoapify unavailable ({_safe_error(errors[0])}).")
     return places
+
+
+def _safe_error(err: Exception) -> str:
+    """Describe a request failure without its URL, which carries the API key."""
+    if isinstance(err, httpx2.HTTPStatusError):
+        return f"HTTP {err.response.status_code}"
+    return type(err).__name__ if not isinstance(err, PlacesUnavailable) else str(err)
 
 
 def _from_geoapify(f: dict, requested: str, center: Location, country_code: str) -> Place | None:
