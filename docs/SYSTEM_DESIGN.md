@@ -205,9 +205,12 @@ All of it is configurable with `GEMINI_MODELS` and `GEMINI_PARSE_MODEL`.
 | Hard diet constraint | food place tagged non-veg | veg status unverified |
 | Crowds (soft constraint) | | likely-crowded place on a Saturday |
 | Weather | | outdoor stop with ≥ 60% rain chance; outdoor stop past sunset |
+| Plan size | more than 5 stops | |
 | Energy | | > 3 stops for low energy |
-| Interests | | food interest but no food stop |
+| Interests | on the first `submit_plan`: an interest the user named has a candidate within 6 km, but no stop covers it and no trade-off explains why (rain exempts outdoor interests) | the same after one revision; food interest but no food stop |
 | Data quality | | generic suggestion used |
+
+The interest rule is a single nudge on purpose: when it stayed an error for two rounds, the model had to juggle it against budget and opening hours, and the evals got slower (up to 6 LLM calls) and worse. Pointing the model at the matching candidates up front (`named_interests` in its first message) fixed the underlying miss instead.
 
 Costs come from `estimate_cost`: per-category price heuristics (INR for India, a generic table elsewhere) plus distance-based travel. The opening-hours parser understands common OSM forms such as `Mo-Su 09:00-21:00; Su off` and `24/7`. Anything fancier counts as unknown rather than a guess.
 

@@ -8,7 +8,8 @@ from urllib.parse import quote_plus
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .checks import RunContext, StopIn, _rain_at, canonical_place_id, estimate_cost, itinerary, to_hhmm, to_min, trip_legs, validate_plan
+from .checks import (RunContext, StopIn, _rain_at, canonical_place_id, estimate_cost, itinerary, to_hhmm, to_min, trip_legs,
+                     uncovered_interests, validate_plan)
 from .geo import travel_leg
 from .hours import open_during
 from .maps import map_path
@@ -221,6 +222,10 @@ async def run_tool(ctx: RunContext, name: str, raw: Any, submit_attempts: int) -
 
     # submit_plan
     v = validate_plan(ctx, args.stops)
+    # The user named it: serve it or explain why not. One nudge only (a second round of competing rules made the
+    # model slower and worse in evals); after that it's a visible warning.
+    v["errors" if submit_attempts == 0 else "warnings"] += uncovered_interests(ctx, args.stops, args.tradeoffs)
+    v["ok"] = not v["errors"]
     if v["errors"] and submit_attempts < 2:
         return ToolOutcome(
             result={

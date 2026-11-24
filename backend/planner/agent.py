@@ -28,6 +28,7 @@ from .geo import ALIASES, GeocodeError, haversine_km, resolve_location, travel_l
 from .models import Place, PlanRequest
 from .parse import parse_preferences
 from .places import cuisine_wish
+from .pricing import is_india
 from .prompts import AGENT_SYSTEM
 from .tools import TOOL_SPECS, FinalStop, PlanB, SubmitIn, build_final_plan, run_tool
 
@@ -123,6 +124,13 @@ def _seed_message(ctx: RunContext, last_draft: dict | None) -> str:
         "food_candidates": [brief(p) for p in ctx.places.values() if p.kind == "food"][:20],
         "travel_rule_of_thumb": "between two stops allow ~6 min plus ~3-4 min per km by auto/cab; up to ~1 km apart is a free walk",
     }
+    matches = {}
+    for cat, labels in ctx.wanted_labels.items():  # point the model at the candidates for each interest the user named
+        options = sorted((p for p in ctx.places.values() if p.category == cat), key=lambda p: p.distance_km)[:3]
+        if options:
+            matches[labels[0]] = [f"{p.name} ({p.id}, {p.distance_km:.1f} km)" for p in options]
+    if matches:
+        data["named_interests"] = {"cover each with a stop unless a trade-off explains why not": matches}
     if ctx.hints:
         data["notes"] = ctx.hints
     if last_draft:
@@ -252,7 +260,12 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     if area and not prefs.area:
         prefs.assumptions.append(f"No neighbourhood given, so the plan starts from {area.name}.")
     ctx = RunContext(prefs=prefs, city=city, center=area or city)
-    ctx.wanted = set(_categories_for(prefs.interests, rainy=False, default=False)) | set(_food_categories(prefs)[2:])
+    for interest in prefs.interests:  # categories the user asked for by name, with their own words for them
+        for cat in _categories_for([interest], rainy=False, default=False):
+            ctx.wanted_labels.setdefault(cat, []).append(interest)
+    for cat in _food_categories(prefs)[2:]:
+        ctx.wanted_labels.setdefault(cat, [{"bar": "drinks", "street_food": "street food"}.get(cat, cat)])
+    ctx.wanted = set(ctx.wanted_labels)
     ctx.cuisine = cuisine_wish(" ".join([*prefs.interests, req.free_text or "", *(c.answer for c in req.clarifications)]))
     if "live_music" in ctx.wanted:
         ctx.hints.append("Map data has no live-music venue type, so theatres and arts centres stand in. Don't promise live music at a "
@@ -263,6 +276,13 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         yield e
     # Something asked for by name is only found far away: gather food around it too, so the model can build
     # the outing there instead of pairing it with stops across town.
+    if ctx.prefs.budget < (600 if is_india(ctx.city.country_code) else 25):
+        free = sorted((p for p in ctx.places.values() if p.kind == "activity" and p.est_cost == 0), key=lambda p: p.distance_km)[:6]
+        ctx.hints.append(
+            f"The budget is tight ({round(ctx.prefs.budget)} {ctx.prefs.currency} including every ride), and rides cost more than most "
+            "tickets. Keep stops within ~1 km of each other (free walks) and lean on free stops"
+            + (": " + ", ".join(f"{p.name} ({p.distance_km:.1f} km from the start)" for p in free) if free else "") + "."
+        )
     if "rain" in req.simulate and ctx.weather is not None:
         ctx.weather = _simulated_rain(ctx.weather)
         yield _ev("status", message="Simulating heavy rain for this run: the forecast now shows a 90% chance of rain all through your window.")

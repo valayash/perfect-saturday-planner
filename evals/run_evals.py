@@ -9,6 +9,7 @@ calls it used.
     python3 evals/run_evals.py                                  # the live site
     python3 evals/run_evals.py --base http://localhost:8000     # a local backend
     python3 evals/run_evals.py --only spec-example,rain
+    python3 evals/run_evals.py --repeat 3                       # LLM output varies: how often does each pass?
 
 Writes evals/RESULTS.md. Standard library only.
 """
@@ -72,7 +73,7 @@ def to_min(hhmm: str) -> int:
 
 def passes_validation(r: Run):
     n = r.plan["validator_issues"]
-    return n == 0, f"{n} validation error(s) left in the final plan"
+    return n == 0, f"{n} validation error(s) left in the final plan: " + " | ".join(e[:110] for e in r.plan["warnings"][:n])
 
 
 def stop_count(r: Run):
@@ -278,61 +279,96 @@ def evaluate(sc: dict, run: Run) -> list[tuple[str, bool, str]]:
     return results
 
 
+def run_once(base: str, sc: dict) -> tuple[Run | None, list[tuple[str, bool, str]]]:
+    try:
+        events, wall = post(base, sc["request"])
+        run = Run(events, wall)
+        return run, evaluate(sc, run)
+    except Exception as err:
+        return None, [("request succeeds", False, f"{type(err).__name__}: {err}")]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default=LIVE, help=f"API base URL (default: {LIVE})")
     ap.add_argument("--only", default="", help="comma-separated scenario ids")
+    ap.add_argument("--repeat", type=int, default=1, help="runs per scenario; LLM output varies, so >1 shows how often each passes")
     ap.add_argument("--out", default=str(OUT), help="where to write the markdown report")
     args = ap.parse_args()
+    base = args.base.rstrip("/")
     chosen = [s for s in SCENARIOS if not args.only or s["id"] in args.only.split(",")]
 
-    rows = []
+    rows = []  # (scenario, [(run, results, failed), ...])
     for sc in chosen:
         print(f"• {sc['id']}: {sc['title']}", flush=True)
-        try:
-            events, wall = post(args.base.rstrip("/"), sc["request"])
-            run = Run(events, wall)
-            results = evaluate(sc, run)
-        except Exception as err:
-            run, results = None, [("request succeeds", False, f"{type(err).__name__}: {err}")]
-        failed = [(name, detail) for name, ok, detail in results if not ok]
-        rows.append((sc, run, results, failed))
-        status = "pass" if not failed else f"FAIL ({len(failed)})"
-        extra = f" {run.seconds}s, {run.done.get('llm_calls', 0)} LLM calls" if run else ""
-        print(f"    {status}{extra}" + "".join(f"\n      ✗ {n}: {d}" for n, d in failed), flush=True)
+        attempts = []
+        for _ in range(args.repeat):
+            run, results = run_once(base, sc)
+            failed = [(name, detail) for name, ok, detail in results if not ok]
+            attempts.append((run, results, failed))
+            extra = f" {run.seconds}s, {run.done.get('llm_calls', 0)} LLM calls" if run else ""
+            print(f"    {'pass' if not failed else f'FAIL ({len(failed)})'}{extra}" + "".join(f"\n      ✗ {n}: {d}" for n, d in failed), flush=True)
+        rows.append((sc, attempts))
 
-    passed = sum(not f for _, _, _, f in rows)
-    plans = [r for _, r, _, _ in rows if r and r.plan]
+    all_runs = [a for _, attempts in rows for a in attempts]
+    clean = sum(not failed for _, _, failed in all_runs)
+    steady = sum(all(not failed for _, _, failed in attempts) for _, attempts in rows)
+    plans = [r for r, _, _ in all_runs if r and r.plan]
     times = [r.seconds for r in plans]
     calls = [r.done.get("llm_calls", 0) for r in plans if r.mode == "agent"]
+    runs_note = f" × {args.repeat} runs each" if args.repeat > 1 else ""
     lines = [
         "# Eval results",
         "",
-        f"Run against `{args.base}` on {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC with `python3 evals/run_evals.py`.",
+        f"Run against `{args.base}` on {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC with "
+        f"`python3 evals/run_evals.py{f' --repeat {args.repeat}' if args.repeat > 1 else ''}` ({len(rows)} scenarios{runs_note}).",
         "",
-        f"**{passed}/{len(rows)} scenarios passed every check.** "
+        (f"**{steady}/{len(rows)} scenarios passed every check in every run ({clean}/{len(all_runs)} runs clean).** " if args.repeat > 1
+         else f"**{clean}/{len(rows)} scenarios passed every check.** ")
         + (f"Plans took {min(times):.1f}–{max(times):.1f} s (median {statistics.median(times):.1f} s); " if times else "")
         + (f"agent plans used {statistics.mean(calls):.1f} LLM calls on average." if calls else ""),
         "",
-        "| Scenario | Result | Checks | Stops | Time | LLM calls | Tokens |",
+        "| Scenario | Result | Checks | Stops (first passing run) | Time | LLM calls | Tokens |",
         "|---|---|---|---|---|---|---|",
     ]
-    for sc, run, results, failed in rows:
-        ok = sum(1 for _, good, _ in results if good)
-        result = "✅ pass" if not failed else "❌ fail"
-        stops = " → ".join(s["name"] for s in run.stops) if run and run.plan else ("asked: " + ", ".join(q.get("id", "?") if isinstance(q, dict) else "?" for q in run.clarify["questions"]) if run and run.clarify else "—")
-        t = f"{run.seconds:.1f} s" if run else "—"
-        lines.append(f"| {sc['title']} | {result} | {ok}/{len(results)} | {stops} | {t} | {run.done.get('llm_calls', 0) if run else '—'} | {run.done.get('tokens', 0) if run else '—'} |")
-    fails = [(sc, n, d) for sc, _, _, failed in rows for n, d in failed]
+    for sc, attempts in rows:
+        good = sum(not failed for _, _, failed in attempts)
+        if args.repeat > 1:
+            result = f"{'✅' if good == len(attempts) else '⚠️' if good else '❌'} {good}/{len(attempts)} runs"
+        else:
+            result = "✅ pass" if good else "❌ fail"
+        show = next((a for a in attempts if not a[2]), attempts[0])
+        run, results, _ = show
+        ok = sum(1 for _, passed, _ in results if passed)
+        if run and run.plan:
+            stops = " → ".join(s["name"] for s in run.stops)
+        elif run and run.clarify:
+            stops = "asked: " + ", ".join(q.get("id", "?") if isinstance(q, dict) else "?" for q in run.clarify["questions"])
+        else:
+            stops = "—"
+        done = [r for r, _, _ in attempts if r]
+        t = f"{statistics.median([r.seconds for r in done]):.1f} s" if done else "—"
+        c = f"{statistics.mean([r.done.get('llm_calls', 0) for r in done]):.1f}".removesuffix(".0") if done else "—"
+        tok = f"{round(statistics.mean([r.done.get('tokens', 0) for r in done]))}" if done else "—"
+        lines.append(f"| {sc['title']} | {result} | {ok}/{len(results)} | {stops} | {t} | {c} | {tok} |")
+    fails = []
+    for sc, attempts in rows:
+        seen: dict[str, tuple[int, str]] = {}
+        for _, _, failed in attempts:
+            for name, detail in failed:
+                count, first = seen.get(name, (0, detail))
+                seen[name] = (count + 1, first)
+        fails += [(sc, name, count, len(attempts), detail) for name, (count, detail) in seen.items()]
     if fails:
-        lines += ["", "## Failed checks", ""] + [f"- **{sc['id']}** · {n}: {d}" for sc, n, d in fails]
+        lines += ["", "## Failed checks", ""]
+        lines += [f"- **{sc['id']}** · {name}" + (f" ({count} of {n} runs)" if n > 1 else "") + f": {detail}" for sc, name, count, n, detail in fails]
     lines += ["", "## What each scenario checks", ""]
     for sc in chosen:
         names = [c.__name__.replace("_", " ") for c in sc["checks"]]
         lines.append(f"- **{sc['id']}**: " + ", ".join(names))
     Path(args.out).write_text("\n".join(lines) + "\n")
-    print(f"\n{passed}/{len(rows)} passed. Report: {args.out}")
-    return 0 if passed == len(rows) else 1
+    print(f"\n{steady if args.repeat > 1 else clean}/{len(rows)} scenarios passed. Report: {args.out}")
+    return 0 if steady == len(rows) else 1
 
 
 if __name__ == "__main__":

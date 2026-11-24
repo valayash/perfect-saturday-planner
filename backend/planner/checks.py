@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from .geo import travel_leg
 from .hours import open_during, saturday_intervals
 from .models import Location, Place, Preferences
+from .pricing import category_meta
 
 BUFFER_RATE = 0.05  # a little slack for tips, a coffee, price drift
 LEVELS = ["low", "medium", "high"]
@@ -23,6 +24,7 @@ class RunContext:
     places: dict[str, Place] = field(default_factory=dict)
     weather: dict | None = None
     wanted: set[str] = field(default_factory=set)  # place categories the user explicitly asked for (e.g. bowling, bar)
+    wanted_labels: dict[str, list[str]] = field(default_factory=dict)  # category -> the user's words for it ("historic": ["history"])
     hints: list[str] = field(default_factory=list)  # facts from data gathering the model should know (e.g. a far-off match)
     cuisine: str | None = None  # a cuisine the user asked for ("north indian")
 
@@ -167,6 +169,25 @@ def _rain_at(ctx: RunContext, minute: int) -> int:
     return 0
 
 
+def uncovered_interests(ctx: RunContext, stops: list[StopIn], tradeoffs: list[str]) -> list[str]:
+    """Interests the user named that a nearby candidate fits, but no stop covers and no trade-off explains."""
+    chosen = {ctx.places[s.place_id].category for s in stops if s.place_id in ctx.places}
+    said = " ".join(tradeoffs).lower()
+    errors = []
+    rainy = bool(ctx.weather and ctx.weather.get("max_rain_chance_in_window", 0) >= 60)
+    for cat, labels in sorted(ctx.wanted_labels.items()):
+        if rainy and not category_meta(cat, ctx.city.country_code)["indoor"]:
+            continue  # rain is reason enough to skip a walk or a park
+        words = [*labels, cat.replace("_", " ")]
+        if cat in chosen or any(re.search(rf"\b{re.escape(w.lower())}", said) for w in words):
+            continue
+        options = sorted((p for p in ctx.places.values() if p.category == cat and p.distance_km <= 6), key=lambda p: p.distance_km)
+        if options:
+            errors.append(f"The user asked for {labels[0]}, and {options[0].name} ({options[0].distance_km:.1f} km away) fits, but no stop "
+                          f"covers it. Swap it in for a less relevant stop, or say in tradeoffs why it's left out (budget, distance, time).")
+    return errors
+
+
 def validate_plan(ctx: RunContext, stops: list[StopIn]) -> dict:
     p = ctx.prefs
     errors: list[str] = []
@@ -277,6 +298,8 @@ def validate_plan(ctx: RunContext, stops: list[StopIn]) -> dict:
     if unknown_hours:
         warnings.append(f"Opening hours unverified for: {', '.join(unknown_hours)}. Suggest checking before going.")
 
+    if len(rows) > 5:
+        errors.append(f"{len(rows)} stops is too many for one Saturday outing. Keep 2–5 and give each one proper time.")
     if p.energy == "low" and len(rows) > 3:
         warnings.append(f"{len(rows)} stops is a lot for someone low on energy. Consider 2–3 relaxed stops.")
     wants_food = any(re.search(r"food|eat|cafe|coffee|dessert|brunch|dinner|lunch", i, re.I) for i in p.interests)
