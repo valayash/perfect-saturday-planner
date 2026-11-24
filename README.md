@@ -15,7 +15,7 @@ Browser (Next.js) ──POST /api/plan──▶ FastAPI (Python) ──▶ LLM t
 1. **`parse_preferences`**: an LLM (structured JSON output) turns the form or free text into typed preferences: minutes, energy level, hard vs soft constraints. In chat ("Just describe it") mode it never assumes the essentials: if the city, budget, time (how long and from when) or mood is missing, code detects it and the agent asks for exactly those, each with quick-pick suggestions. Plans always end by 23:00.
 2. **`resolve_location`**: geocodes the city and neighbourhood (Open-Meteo).
 3. **Gather (code, in parallel)**: Saturday's forecast plus activity and food candidates near the user's area from a live places API (Geoapify, or the public OpenStreetMap servers); curated places only fill gaps and add known prices, hours and veg status to matching live results.
-4. **Plan + revise (LLM agent)**: the model gets the candidates and calls `submit_plan`. The server fixes timing slips itself (moves stops later to fit real travel time, rounds to 5 min), validates the rest and sends back anything the model must fix. Typically 2 LLM calls in total (~6K tokens, ~10–20 s), with `gpt-oss` served by Cerebras/Groq through Vercel AI Gateway.
+4. **Plan + revise (LLM agent)**: the model gets the candidates and calls `submit_plan`. The server fixes timing slips itself (moves stops later to fit real travel time, rounds to 5 min), validates the rest and sends back anything the model must fix. Typically 2–3 LLM calls in total (~7–15K tokens; median ~7 s in the evals): parsing on Gemini 2.5 Flash-Lite and planning on `gpt-oss-120b` (Cerebras/Groq), both through Vercel AI Gateway.
 
 Plans include the ride from the user's area to the first stop and back home ("home around 19:04"), a 5% budget buffer, crowd level at that hour, the rain window, a plain-language "Worth knowing" list, the parser's assumptions, a **route map** with numbered stops (Geoapify Static Maps, served through a signed `/api/map` URL so the key stays on the server) and a Google Maps route.
 
@@ -61,7 +61,24 @@ Two failure drills are built in, for the evals and for anyone testing the API: a
 
 `python3 evals/run_evals.py` sends 10 fixed requests to the live API (or `--base http://localhost:8000`) and checks each result automatically: the plan passes the server's validation, has 2–5 explained and distinct stops, stays inside the budget and time window, has a route map, and meets the scenario's own expectations (vegetarian food only, indoor in rain, a free stop on a tight budget, asking before planning a vague request, and so on). It writes [`evals/RESULTS.md`](evals/RESULTS.md).
 
-_Latest run: results below are filled in by the most recent run against the live site._
+Latest run against the live site, every scenario twice (2026-11-24 18:55 UTC):
+
+**8/10 scenarios passed every check in every run (18/20 runs clean).** Plans took 0.1–16.5 s (median 7.2 s); agent plans used 2.6 LLM calls on average.
+
+| Scenario | Result | Checks | Stops (first passing run) | Time | LLM calls | Tokens |
+|---|---|---|---|---|---|---|
+| The assignment's example input | ⚠️ 1/2 runs | 11/11 | Venkatappa Art Gallery → Chowdiah Memorial Hall → Konark Kanteerava | 6.9 s | 3 | 15456 |
+| Vague chat request | ✅ 2/2 runs | 2/2 | asked: city, budget, time, mood | 2.0 s | 0 | 0 |
+| Vague request + answers (Pune) | ✅ 2/2 runs | 10/10 | 7 to 9 Grams Coffee → Osho Teerth Park → Blue Tokai Coffee Roasters | 7.5 s | 2 | 7141 |
+| Rain all afternoon (simulated) | ✅ 2/2 runs | 8/8 | Ainmane → Manora → Artisera | 8.2 s | 2 | 6719 |
+| Smaller city with thin map data (Nashik) | ✅ 2/2 runs | 8/8 | Baba Ambedkar Municipal Gardens → Kulkarni's Pav Bhaji → WeGo Art Gallery and Art Exhibition | 9.7 s | 3 | 12531 |
+| Tight budget (₹300 in Mumbai) | ⚠️ 1/2 runs | 8/8 | Colaba Woods Garden → Mumbai Port Trust Garden → art gallery → Oxford Bookstore | 14.7 s | 4 | 23797 |
+| Wish only available far away (bowling, Gurugram) | ✅ 2/2 runs | 9/9 | The Big Shot → Om Bookshop → Barista | 8.0 s | 2.5 | 12496 |
+| History, art and a North Indian lunch (Delhi) | ✅ 2/2 runs | 9/9 | Lokayata Art Gallery → Maheshi Da Frontier Punjabi Dhaba → OPS → Barah Khamba → Kunzum | 8.2 s | 2 | 7742 |
+| Outside India (London) | ✅ 2/2 runs | 9/9 | Nero Express → National Gallery → Notes | 4.8 s | 2 | 7650 |
+| Every LLM unavailable (simulated) | ✅ 2/2 runs | 9/9 | St. John's Auditorium → Utsav | 1.0 s | 0 | 0 |
+
+Both misses are plans where the model's two allowed revisions didn't clear the last error (a gallery visit running past closing time; ₹370 against a ₹300 budget). The server then shows the problem in the plan's heads-up box instead of hiding it. Building the set paid off: it caught the model skipping a requested interest (now listed for it up front), budget plans that never walked anywhere (now free up to ~1 km, with budget-eatery prices), and a stricter rule that made plans slower and worse (rolled back to a single nudge).
 
 ## Run locally
 
