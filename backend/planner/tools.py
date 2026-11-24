@@ -197,7 +197,7 @@ async def run_tool(ctx: RunContext, name: str, raw: Any, submit_attempts: int) -
             cuisine=getattr(args, "cuisine", None),
         )
         _register(ctx, places)
-        label = notes[0] if notes and "curated" in notes[0] else {"live": "live OpenStreetMap", "curated": "curated", "fallback": "curated", "generic": "generic fallback"}[source]
+        label = notes[0] if notes and "curated" in notes[0] else {"live": "live map data", "curated": "curated", "generic": "generic fallback"}[source]
         radius = f"within {args.radius_km:g} km" + (" of your area" if not args.near_place_id else " of the chosen stop")
         return ToolOutcome(
             result={"source": source, "notes": notes, "currency": p.currency, "places": [x.brief() for x in places]},

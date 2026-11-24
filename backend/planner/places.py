@@ -1,12 +1,11 @@
 """Real places from live map APIs, with curated and generic fallbacks.
 
-Live sources, best first:
+Live sources:
   * Geoapify Places (when GEOAPIFY_API_KEY is set): fast, reliable category search over OpenStreetMap,
     with OSM tags (opening hours, diet, cuisine) attached.
-  * Overpass: rich tags but the public servers are often at capacity.
-  * Photon (komoot): fast OSM search with category filters, but names and locations only.
-Overpass and Photon race each other when Geoapify is unavailable. Curated data only fills gaps when live
-results are thin; generic suggestions are the last resort.
+  * Photon (komoot), keyless: OSM search with category filters, but names and locations only. Used
+    without a Geoapify key or when Geoapify fails.
+Curated data only fills gaps when live results are thin; generic suggestions are the last resort.
 """
 
 from __future__ import annotations
@@ -24,11 +23,7 @@ from .geo import USER_AGENT, haversine_km
 from .models import Location, Place
 from .pricing import category_meta, place_cost
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-OVERPASS_TIMEOUT = 1.5  # the public servers are usually at capacity; never let them hold up a plan
-OVERPASS_COOLDOWN = 600  # after a failure, skip Overpass for 10 minutes
 PHOTON_URL = "https://photon.komoot.io/api/"
-_overpass_down_until = 0.0
 _photon_slots = asyncio.Semaphore(3)
 _photon_down_until = 0.0
 PHOTON_COOLDOWN = 300
@@ -75,35 +70,35 @@ GEOAPIFY_CATEGORIES: dict[str, str] = {
     "bar": "catering.bar,catering.pub,catering.biergarten,catering.taproom",
 }
 
-# category -> [(search text, osm_tag filter)] for Photon
-PHOTON_QUERIES: dict[str, list[tuple[str, str]]] = {
-    "park": [("park", "leisure:park")],
-    "garden": [("garden", "leisure:garden")],
-    "lake": [("lake", "natural:water")],
-    "viewpoint": [("viewpoint", "tourism:viewpoint")],
-    "beach": [("beach", "natural:beach")],
-    "museum": [("museum", "tourism:museum")],
-    "gallery": [("gallery", "tourism:gallery"), ("art", "tourism:gallery")],
-    "arts_centre": [("arts", "amenity:arts_centre"), ("centre", "amenity:arts_centre")],
-    "live_music": [("music", "amenity:music_venue"), ("live music", "amenity:bar"), ("music", "amenity:pub")],
-    "theatre": [("theatre", "amenity:theatre")],
-    "cinema": [("cinema", "amenity:cinema")],
-    "bookstore": [("books", "shop:books"), ("book", "shop:books")],
-    "library": [("library", "amenity:library")],
-    "market": [("market", "amenity:marketplace")],
-    "mall": [("mall", "shop:mall")],
-    "historic": [("monument", "historic"), ("fort", "historic"), ("palace", "historic")],
-    "bowling": [("bowling", "leisure:bowling_alley")],
-    "arcade": [("arcade", "leisure:amusement_arcade"), ("games", "leisure:amusement_arcade")],
-    "escape_room": [("escape", "leisure:escape_game")],
-    "sports": [("sports", "leisure:sports_centre")],
-    "spa": [("spa", "leisure:spa")],
-    "cafe": [("cafe", "amenity:cafe"), ("coffee", "amenity:cafe")],
-    "restaurant": [("restaurant", "amenity:restaurant"), ("veg", "amenity:restaurant")],
-    "fast_food": [("food", "amenity:fast_food")],
-    "dessert": [("ice cream", "amenity:ice_cream"), ("bakery", "shop:bakery")],
-    "street_food": [("food court", "amenity:food_court")],
-    "bar": [("pub", "amenity:pub"), ("bar", "amenity:bar")],
+# category -> (search text, osm_tag filter) for Photon
+PHOTON_QUERIES: dict[str, tuple[str, str]] = {
+    "park": ("park", "leisure:park"),
+    "garden": ("garden", "leisure:garden"),
+    "lake": ("lake", "natural:water"),
+    "viewpoint": ("viewpoint", "tourism:viewpoint"),
+    "beach": ("beach", "natural:beach"),
+    "museum": ("museum", "tourism:museum"),
+    "gallery": ("gallery", "tourism:gallery"),
+    "arts_centre": ("arts", "amenity:arts_centre"),
+    "live_music": ("music", "amenity:music_venue"),
+    "theatre": ("theatre", "amenity:theatre"),
+    "cinema": ("cinema", "amenity:cinema"),
+    "bookstore": ("books", "shop:books"),
+    "library": ("library", "amenity:library"),
+    "market": ("market", "amenity:marketplace"),
+    "mall": ("mall", "shop:mall"),
+    "historic": ("monument", "historic"),
+    "bowling": ("bowling", "leisure:bowling_alley"),
+    "arcade": ("arcade", "leisure:amusement_arcade"),
+    "escape_room": ("escape", "leisure:escape_game"),
+    "sports": ("sports", "leisure:sports_centre"),
+    "spa": ("spa", "leisure:spa"),
+    "cafe": ("cafe", "amenity:cafe"),
+    "restaurant": ("restaurant", "amenity:restaurant"),
+    "fast_food": ("food", "amenity:fast_food"),
+    "dessert": ("ice cream", "amenity:ice_cream"),
+    "street_food": ("food court", "amenity:food_court"),
+    "bar": ("pub", "amenity:pub"),
 }
 
 # cuisine wish -> (words in the user's request, Geoapify categories, pattern for a place's cuisine tag or name)
@@ -130,80 +125,12 @@ VEG_NAME = re.compile(r"\b(pure veg|veg|vegetarian|vegan)\b", re.I)
 VEG_LIKELY_NAME = re.compile(r"sagar|bhavan|bhawan|udupi|udipi|darshini|thali|annapoorn|sweets|upahar", re.I)
 NONVEG_NAME = re.compile(r"non[- ]?veg|meat|chicken|mutton|biryani|kebab|fish|seafood|military|chettinad|barbeque|bbq|grill|steak", re.I)
 
-# category -> Overpass selectors (each must also have a name)
-SELECTORS: dict[str, list[str]] = {
-    "park": ['["leisure"="park"]'],
-    "garden": ['["leisure"="garden"]["access"!="private"]'],
-    "lake": ['["natural"="water"]["water"~"^(lake|reservoir|pond)$"]'],
-    "viewpoint": ['["tourism"="viewpoint"]'],
-    "beach": ['["natural"="beach"]'],
-    "museum": ['["tourism"="museum"]'],
-    "gallery": ['["tourism"="gallery"]'],
-    "arts_centre": ['["amenity"="arts_centre"]'],
-    "live_music": ['["amenity"="music_venue"]', '["live_music"="yes"]'],
-    "theatre": ['["amenity"="theatre"]'],
-    "cinema": ['["amenity"="cinema"]'],
-    "bookstore": ['["shop"="books"]'],
-    "library": ['["amenity"="library"]'],
-    "market": ['["amenity"="marketplace"]'],
-    "mall": ['["shop"="mall"]'],
-    "historic": ['["historic"~"^(monument|memorial|castle|fort|palace|ruins|archaeological_site)$"]'],
-    "bowling": ['["leisure"="bowling_alley"]'],
-    "arcade": ['["leisure"="amusement_arcade"]'],
-    "escape_room": ['["leisure"="escape_game"]'],
-    "sports": ['["leisure"="sports_centre"]'],
-    "spa": ['["leisure"="spa"]'],
-    "cafe": ['["amenity"="cafe"]'],
-    "restaurant": ['["amenity"="restaurant"]'],
-    "fast_food": ['["amenity"="fast_food"]'],
-    "dessert": ['["amenity"="ice_cream"]', '["shop"~"^(bakery|confectionery|pastry)$"]'],
-    "street_food": ['["amenity"="food_court"]'],
-    "bar": ['["amenity"~"^(bar|pub|biergarten)$"]'],
-}
-
 # Cuisines that are a poor bet for vegetarians even if the place is untagged.
 MEAT_CUISINES = re.compile(r"steak|bbq|barbecue|kebab|chicken|seafood|fish|burger|meat|grill|biryani|mughlai|korean", re.I)
 
 
 class PlacesUnavailable(Exception):
     pass
-
-
-def classify(tags: dict) -> str | None:
-    """Map OSM tags back to one of our categories."""
-    for category, selectors in SELECTORS.items():
-        for sel in selectors:
-            ok = True
-            for key, op, val in re.findall(r'\["([^"]+)"(=|!=|~)"([^"]+)"\]', sel):
-                actual = tags.get(key)
-                if op == "=" and actual != val:
-                    ok = False
-                elif op == "!=" and actual == val:
-                    ok = False
-                elif op == "~" and (actual is None or not re.search(val, actual)):
-                    ok = False
-            if ok:
-                return category
-    return None
-
-
-async def _overpass(categories: list[str], lat: float, lon: float, radius_m: int) -> list[dict]:
-    global _overpass_down_until
-    if time.monotonic() < _overpass_down_until:
-        raise PlacesUnavailable("Overpass skipped (failed recently).")
-    parts = []
-    for cat in categories:
-        for sel in SELECTORS.get(cat, []):
-            parts.append(f'nwr{sel}["name"](around:{radius_m},{lat:.5f},{lon:.5f});')
-    query = f"[out:json][timeout:8];({''.join(parts)});out center tags 400;"
-    try:
-        async with httpx2.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": query}, timeout=OVERPASS_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json().get("elements", [])
-    except (httpx2.HTTPError, ValueError) as err:
-        _overpass_down_until = time.monotonic() + OVERPASS_COOLDOWN
-        raise PlacesUnavailable(f"Overpass unavailable ({type(err).__name__}).") from err
 
 
 def _veg_from_name(name: str) -> tuple[str, str | None]:
@@ -265,11 +192,11 @@ async def _photon(categories: list[str], center: Location, radius_km: float, cou
             ))
         return out
 
-    queries = [(cat, *PHOTON_QUERIES[cat][0]) for cat in categories if cat in PHOTON_QUERIES]
+    queries = [(cat, *PHOTON_QUERIES[cat]) for cat in categories if cat in PHOTON_QUERIES]
     if vegetarian and "restaurant" in categories:
         queries.append(("restaurant", "veg", "amenity:restaurant"))
     if "bar" in categories:
-        queries.append(("bar", *PHOTON_QUERIES["bar"][1]))
+        queries.append(("bar", "bar", "amenity:bar"))  # PHOTON_QUERIES["bar"] covers pubs
     async with httpx2.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
         results = await asyncio.gather(*(one(client, *q) for q in queries), return_exceptions=True)
     places = [p for r in results if isinstance(r, list) for p in r]
@@ -398,59 +325,14 @@ def _from_geoapify(f: dict, requested: str, center: Location, country_code: str)
 
 async def _live(categories: list[str], center: Location, radius_km: float, country_code: str, vegetarian: bool,
                 cuisine: str | None = None) -> tuple[list[Place], str]:
-    """Geoapify when configured; otherwise (or if it fails) Overpass and Photon in parallel, preferring Overpass."""
+    """Geoapify when configured; otherwise (or if it fails) Photon."""
     fell_back = ""
     if geoapify_key():
         try:
             return await _geoapify(categories, center, radius_km, country_code, vegetarian, cuisine=cuisine), "Geoapify Places (OpenStreetMap)"
         except PlacesUnavailable as err:
             fell_back = f" ({err})"
-    overpass = asyncio.create_task(_overpass(categories, center.lat, center.lon, int(radius_km * 1000)))
-    photon = asyncio.create_task(_photon(categories, center, radius_km, country_code, vegetarian))
-    try:
-        elements = await overpass
-        places = [p for el in elements if (p := _from_osm(el, center, country_code))]
-        if places:
-            photon.cancel()
-            return places, "OpenStreetMap (Overpass)" + fell_back
-    except PlacesUnavailable:
-        pass
-    return await photon, "OpenStreetMap (Photon)" + fell_back
-
-
-def _from_osm(el: dict, center: Location, country_code: str) -> Place | None:
-    tags = el.get("tags") or {}
-    category = classify(tags)
-    if not category or not tags.get("name"):
-        return None
-    lat = el.get("lat") or (el.get("center") or {}).get("lat")
-    lon = el.get("lon") or (el.get("center") or {}).get("lon")
-    if lat is None or lon is None:
-        return None
-    meta = category_meta(category, country_code)
-    crowd = meta["crowd"]
-    famous = bool(tags.get("wikidata") or tags.get("wikipedia") or tags.get("tourism") == "attraction")
-    if famous and meta["kind"] == "activity" and crowd != "high":
-        crowd = "high" if crowd == "medium" else "medium"
-    fee = tags.get("fee")
-    cost = 0 if fee == "no" else place_cost(tags.get("name:en") or tags["name"], category, country_code)
-    return Place(
-        id=f"osm:{el['type'][0]}{el['id']}",
-        name=tags.get("name:en") or tags["name"],
-        category=category,
-        kind=meta["kind"],
-        lat=lat,
-        lon=lon,
-        distance_km=haversine_km(center.lat, center.lon, lat, lon),
-        indoor=meta["indoor"],
-        est_cost=cost,
-        crowd=crowd,
-        opening_hours=tags.get("opening_hours"),
-        cuisine=tags.get("cuisine"),
-        veg=_veg_status(tags) if meta["kind"] == "food" else None,
-        website=tags.get("website") or tags.get("contact:website"),
-        note="well-known spot" if famous else None,
-    )
+    return await _photon(categories, center, radius_km, country_code, vegetarian), "OpenStreetMap (Photon)" + fell_back
 
 
 def _score(p: Place, vegetarian: bool, cuisine: str | None = None) -> float:
@@ -566,7 +448,7 @@ async def find_places(
     categories (ones the user asked for by name) with nothing nearby, the nearest match within 25 km is added.
     """
     notes: list[str] = []
-    categories = [c for c in categories if c in SELECTORS] or (["park", "museum", "bookstore"] if kind == "activity" else ["cafe", "restaurant"])
+    categories = [c for c in categories if c in GEOAPIFY_CATEGORIES] or (["park", "museum", "bookstore"] if kind == "activity" else ["cafe", "restaurant"])
     radius_km = max(0.5, min(radius_km, 12))
 
     curated = _filter(curated_places(city, center, kind, categories, strict=True), indoor_only, vegetarian, max_price)

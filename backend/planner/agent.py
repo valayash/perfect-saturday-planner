@@ -5,21 +5,18 @@ Workflow:
   2. resolve_location    (code)                       -> city / neighbourhood coordinates
   3. gather data         (code, in parallel)          -> weather, activity candidates, food candidates
   4. plan + revise       (LLM agent with tools)       -> submit_plan, re-validated by the server
-Provider chain for step 4: Vercel AI Gateway models -> Gemini API models -> rule-based planner.
+Step 4 falls back across Vercel AI Gateway models, then to a rule-based planner that needs no LLM.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
-from google import genai
-from google.genai import errors, types
 from openai import AsyncOpenAI
 
 from .checks import RunContext, StopIn, to_hhmm, to_min, validate_plan
@@ -30,22 +27,12 @@ from .parse import parse_preferences
 from .places import cuisine_wish
 from .pricing import is_india
 from .prompts import AGENT_SYSTEM
-from .tools import TOOL_SPECS, FinalStop, PlanB, SubmitIn, build_final_plan, run_tool
+from .tools import FinalStop, PlanB, SubmitIn, build_final_plan, run_tool
 
-# Gemini models, tried in order; the run switches to the next one if a model is overloaded.
-MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
-MID_RUN_RETRIES = 2  # then hand off to the next model (Gemini history is tied to one model's thought signatures)
-THINKING_LEVEL = {"gemini-4-hydrogen": "medium", "gemini-4-neon": "medium"}  # others: "low"
 MAX_TURNS = 8
 DEADLINE_S = 240  # Vercel Hobby functions stop at 300s
-TURN_TIMEOUT_MS = 20_000
 GATEWAY_TURN_TIMEOUT_S = 45
 NUDGE = "Please finish now by calling submit_plan with your plan."
-
-GEMINI_TOOLS = types.Tool(function_declarations=[
-    types.FunctionDeclaration(name=t["name"], description=t["description"], parameters_json_schema=t["parameters"])
-    for t in TOOL_SPECS
-])
 
 LABELS = {
     "get_weather": "Checking Saturday's weather",
@@ -57,13 +44,9 @@ LABELS = {
 }
 
 
-class ModelBusy(Exception):
-    """Overloaded, rate-limited or timed out: worth trying another model."""
-
-
 @dataclass
 class LoopState:
-    """Shared across provider stages so a later stage can pick up where an earlier one stopped."""
+    """What the agent loop has done so far; the rule-based fallback reads it when the loop gives up."""
 
     started: float
     submit_attempts: int = 0
@@ -209,12 +192,8 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     steps = _Steps()
     state = LoopState(started=started)
     gateway = gateway_client(oidc_token)
-    try:
-        gemini: genai.Client | None = genai.Client()  # reads GEMINI_API_KEY
-    except Exception:  # no API key configured
-        gemini = None
     if "llm_down" in req.simulate:  # failure drill: behave as if every model provider were unreachable
-        gateway = gemini = None
+        gateway = None
         state.failure = "The AI models are switched off for this run (simulated outage)"
 
     # 1. understand preferences (LLM)
@@ -223,7 +202,7 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     meta: dict = {}
     # Geocode the city from the form while the model reads the request; reused if the parse agrees on the city.
     early_geo = asyncio.create_task(resolve_location(req.city, req.area, None)) if req.city else None
-    prefs, parse_source = await parse_preferences(gemini, req, gateway, meta)
+    prefs, parse_source = await parse_preferences(req, gateway, meta)
     if meta.get("model"):
         state.llm_calls += 1
         state.tokens += meta.get("tokens", 0)
@@ -274,8 +253,6 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     # 3. gather weather and candidates (code, in parallel)
     async for e in _run_calls(ctx, steps, state, _gather_calls(ctx)):
         yield e
-    # Something asked for by name is only found far away: gather food around it too, so the model can build
-    # the outing there instead of pairing it with stops across town.
     if ctx.prefs.budget < (600 if is_india(ctx.city.country_code) else 25):
         free = sorted((p for p in ctx.places.values() if p.kind == "activity" and p.est_cost == 0), key=lambda p: p.distance_km)[:6]
         ctx.hints.append(
@@ -286,6 +263,8 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     if "rain" in req.simulate and ctx.weather is not None:
         ctx.weather = _simulated_rain(ctx.weather)
         yield _ev("status", message="Simulating heavy rain for this run: the forecast now shows a 90% chance of rain all through your window.")
+    # Something asked for by name is only found far away: gather food around it too, so the model can build
+    # the outing there instead of pairing it with stops across town.
     if far := _far_wanted(ctx):
         ctx.hints.append(
             f"The only {far.category.replace('_', ' ')} found is {far.name}, {far.distance_km:.0f} km from the user's area. Food candidates "
@@ -297,14 +276,9 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
         async for e in _run_calls(ctx, steps, state, [(None, "find_food", food_args)]):
             yield e
 
-    # 4. plan + revise (LLM agent): AI Gateway, then Gemini, then rules
-    stages = []
+    # 4. plan + revise (LLM agent through AI Gateway), else the rule-based plan
     if gateway:
-        stages.append(_gateway_loop(gateway, ctx, steps, state))
-    if gemini:
-        stages.append(_gemini_loop(gemini, ctx, steps, state))
-    for stage in stages:
-        async for e in stage:
+        async for e in _gateway_loop(gateway, ctx, steps, state):
             yield e
         if state.final_plan:
             seconds = round(time.monotonic() - started, 1)
@@ -312,8 +286,6 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
             yield _ev("plan", plan=state.final_plan, mode="agent", model=state.model)
             yield _ev("done", seconds=seconds, llm_calls=state.llm_calls, tokens=state.tokens)
             return
-        if state.out_of_time():
-            break
     reason = state.failure or ("The agent ran out of time before finishing" if state.out_of_time() else "The AI model is unavailable right now")
     async for e in _rule_based_plan(ctx, steps, reason=reason):
         if e["type"] == "done":  # same stats as an agent run, so the UI and the evals can compare them
@@ -351,7 +323,6 @@ async def _gateway_loop(client: AsyncOpenAI, ctx: RunContext, steps: _Steps, sta
             yield steps.end(sid, t0, f"{model}: {error_text(err)}", ok=False, source="gateway")
             if is_account_problem(err):
                 state.failure = f"Vercel AI Gateway refused the request ({error_text(err)})"
-                yield _ev("status", message=f"{state.failure}. Trying the Gemini API instead.")
                 return
             if is_busy(err) and retries < 1:
                 retries += 1
@@ -362,7 +333,6 @@ async def _gateway_loop(client: AsyncOpenAI, ctx: RunContext, steps: _Steps, sta
                 yield _ev("status", message=f"{model} failed ({error_text(err)}). Switching to {GATEWAY_MODELS[model_idx]}.", tone="info")
                 continue
             state.failure = f"Every AI Gateway model failed ({error_text(err)})"
-            yield _ev("status", message=f"{state.failure}. Trying the Gemini API instead.")
             return
         retries, turns = 0, turns + 1
         state.llm_calls += 1
@@ -406,122 +376,6 @@ async def _gateway_loop(client: AsyncOpenAI, ctx: RunContext, steps: _Steps, sta
             messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(payload, ensure_ascii=False)})
     if not state.failure:
         state.failure = "The AI Gateway agent didn't finish in time"
-
-
-async def _gemini_loop(client: genai.Client, ctx: RunContext, steps: _Steps, state: LoopState) -> AsyncIterator[dict]:
-    """Gemini function-calling loop (google-genai). Model parts are appended verbatim: they carry thought signatures."""
-    contents: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=_seed_message(ctx, state.last_draft))])]
-    model_idx, good_turns, retries, turns = 0, 0, 0, 0
-    while turns < MAX_TURNS and not state.out_of_time():
-        model = MODELS[model_idx]
-        name, label = _llm_step_label(turns, state)
-        ev, sid, t0 = steps.start(name, label, {"model": model, "via": "Gemini API"}, actor="llm")
-        yield ev
-        parts: list[types.Part] | None = None
-        finish = None
-        try:
-            async for item in _model_turn(client, model, contents, sid):
-                if isinstance(item, dict):
-                    yield item
-                else:
-                    parts, finish = item
-        except ModelBusy as err:
-            yield steps.end(sid, t0, str(err), ok=False, source="gemini")
-            if good_turns == 0 and model_idx + 1 < len(MODELS):
-                model_idx += 1
-                continue
-            if retries < MID_RUN_RETRIES:
-                retries += 1
-                await asyncio.sleep(1.5 * retries)
-                continue
-            if model_idx + 1 < len(MODELS):  # hand off: fresh conversation for the next model, seeded with the work so far
-                model_idx, retries, good_turns = model_idx + 1, 0, 0
-                contents = [types.Content(role="user", parts=[types.Part(text=_seed_message(ctx, state.last_draft))])]
-                continue
-            state.failure = f"The AI model is overloaded ({err})"
-            return
-        except errors.APIError as err:  # bad key, invalid request...
-            yield steps.end(sid, t0, f"{model}: {err.code} {err.status}", ok=False, source="gemini")
-            state.failure = f"The AI model rejected the request ({err.code} {err.status})"
-            return
-        except Exception as err:
-            yield steps.end(sid, t0, f"{model}: {type(err).__name__}", ok=False, source="gemini")
-            state.failure = f"The AI model stopped responding ({type(err).__name__})"
-            return
-
-        good_turns, turns, retries = good_turns + 1, turns + 1, 0
-        state.llm_calls += 1
-        calls = [p.function_call for p in parts if p.function_call]
-        yield steps.end(sid, t0, f"{model}" + (f" → {', '.join(fc.name for fc in calls)}" if calls else " → no tool call"), source="gemini",
-                        output={"model": model, "tool_calls": [fc.name for fc in calls], "finish_reason": finish})
-        if finish in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"):
-            state.failure = "The model declined this request"
-            return
-        if finish == "MAX_TOKENS" and calls:
-            state.failure = "The plan got too long for the model to finish"
-            return
-        contents.append(types.Content(role="model", parts=parts))
-        if not calls:
-            contents.append(types.Content(role="user", parts=[types.Part(text=NUDGE)]))
-            continue
-        async for e in _run_calls(ctx, steps, state, [(fc.id, fc.name, fc.args or {}) for fc in calls], actor="code", from_model=True):
-            yield e
-        if state.final_plan:
-            state.model = model
-            return
-        contents.append(types.Content(role="user", parts=[
-            types.Part(function_response=types.FunctionResponse(id=call_id, name=name, response=payload))
-            for call_id, name, payload in state.results
-        ]))
-    if not state.failure:
-        state.failure = "The Gemini agent didn't finish in time"
-
-
-async def _model_turn(client: genai.Client, model: str, contents: list[types.Content], turn_id: str):
-    """Stream one Gemini turn. Yields thought events, then (parts, finish_reason)."""
-    config = types.GenerateContentConfig(
-        system_instruction=AGENT_SYSTEM,
-        tools=[GEMINI_TOOLS],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        thinking_config=types.ThinkingConfig(include_thoughts=True, thinking_level=THINKING_LEVEL.get(model, "low")),
-        max_output_tokens=16_000,
-        http_options=types.HttpOptions(timeout=TURN_TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1)),
-    )
-    parts: list[types.Part] = []
-    finish = None
-    block, block_kind, n = None, None, 0
-    try:
-        stream = await client.aio.models.generate_content_stream(model=model, contents=contents, config=config)
-        async for chunk in stream:
-            cand = chunk.candidates[0] if chunk.candidates else None
-            if not cand:
-                continue
-            if cand.finish_reason:
-                finish = cand.finish_reason.value if hasattr(cand.finish_reason, "value") else str(cand.finish_reason)
-            for part in (cand.content.parts if cand.content and cand.content.parts else []):
-                parts.append(part)  # keep every part, even empty ones: one may hold the thought signature
-                if part.text and not part.function_call:
-                    kind = "thought" if part.thought else "text"
-                    if kind != block_kind:
-                        n += 1
-                        block, block_kind = f"{turn_id}-{n}", kind
-                        yield _ev("thought_start", block=block, kind=kind)
-                    yield _ev("thought_delta", block=block, text=part.text)
-    except errors.ServerError as err:
-        raise ModelBusy(f"{model} is unavailable ({err.code})") from err
-    except errors.ClientError as err:
-        if err.code == 429:
-            raise ModelBusy(f"{model} is rate-limited (429)") from err
-        raise
-    except (asyncio.TimeoutError, TimeoutError) as err:
-        raise ModelBusy(f"{model} timed out") from err
-    except Exception as err:
-        if "timeout" in type(err).__name__.lower():
-            raise ModelBusy(f"{model} timed out") from err
-        raise
-    if not parts:
-        raise ModelBusy(f"{model} returned an empty response")
-    yield (parts, finish)
 
 
 async def _rule_based_plan(ctx: RunContext, steps: _Steps, reason: str) -> AsyncIterator[dict]:

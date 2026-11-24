@@ -31,18 +31,18 @@ flowchart LR
     A -- "SSE stream:<br/>trace + plan" --> U
 
     subgraph Agent["Agent runtime (inside the api service)"]
-        P["parse_preferences"] --> L["resolve_location"] --> LOOP["Gemini function-calling loop"]
+        P["parse_preferences"] --> L["resolve_location"] --> LOOP["Tool-calling agent loop"]
         LOOP --> T["Tools"]
         T --> V["Deterministic checks<br/>estimate_cost / validate_plan"]
     end
     A --- Agent
 
     LOOP -- "chat completions + tools" --> GW[("Vercel AI Gateway<br/>gpt-oss-120b, Gemini 2.5 Flash-Lite,<br/>Qwen 3.7 Flash")]
-    LOOP -. "if the gateway fails" .-> G[("Gemini API<br/>model fallback chain")]
+    LOOP -. "every model fails" .-> RB["Rule-based planner<br/>(same tools, no LLM)"]
     P -- "structured JSON" --> GW
     T -- "forecast" --> OM[("Open-Meteo<br/>weather + geocoding")]
     T -- "POIs + OSM tags (with key)" --> GA[("Geoapify Places<br/>+ geocoding")]
-    T -. "no key / Geoapify down" .-> OP[("OSM Overpass + Photon")]
+    T -. "no key / Geoapify down" .-> OP[("OSM Photon")]
     T -. "fills thin areas" .-> CU[("Curated city data")]
 ```
 
@@ -50,9 +50,9 @@ flowchart LR
 |---|---|---|
 | **web** service | Next.js 16, React 19, Tailwind 4 | Form or free-text input, clarification prompts, live trace, plan rendering |
 | **api** service | FastAPI, Python 3.12 | Streams the agent run as Server-Sent Events; rate limiting; keep-alives |
-| Agent runtime | `openai` SDK (AI Gateway), `google-genai` SDK | Preference parsing, the tool loop, provider and model fallback, rule-based fallback |
+| Agent runtime | `openai` SDK pointed at Vercel AI Gateway | Preference parsing, the tool loop, model fallback, rule-based fallback |
 | Tools | Python, `httpx2` | Weather, places, cost and validation; all facts come from here |
-| External data | Geoapify Places + geocoding (free key), Open-Meteo, OSM Overpass, OSM Photon | Real data; Geoapify is primary when its key is set, the rest are keyless |
+| External data | Geoapify Places, geocoding and static maps (free key), Open-Meteo, OSM Photon | Real data; Geoapify is primary when its key is set, the rest are keyless |
 
 Both services ship as **one Vercel project** using [Vercel Services](https://vercel.com/docs/services). The browser talks only to the site's own origin, so there's no CORS, and the API key stays server-side.
 
@@ -67,16 +67,16 @@ sequenceDiagram
     participant UI as Next.js UI
     participant API as FastAPI /api/plan
     participant Agent as Agent runtime
-    participant Gemini
-    participant Data as Open-Meteo / OSM
+    participant LLM as AI Gateway
+    participant Data as Geoapify / Open-Meteo
 
     User->>UI: fill form or describe it, press Plan
     UI->>API: POST /api/plan (JSON)
     API-->>UI: 200 text/event-stream (stays open)
     API->>Agent: run(request)
 
-    Agent->>Gemini: parse_preferences (structured JSON)
-    Gemini-->>Agent: Preferences
+    Agent->>LLM: parse_preferences (structured JSON)
+    LLM-->>Agent: Preferences
     Agent-->>UI: step_end, preferences
     alt input too vague / no city
         Agent-->>UI: clarify (1-2 questions)
@@ -87,16 +87,16 @@ sequenceDiagram
 
     Agent->>Data: geocode city + neighbourhood
     Agent-->>UI: step_end (resolve_location)
+    par gathered by code
+        Agent->>Data: get_weather / find_activities / find_food
+    end
+    Agent-->>UI: step_end (per call)
 
-    loop until submit_plan accepted (max 10 turns, 240 s)
-        Agent->>Gemini: contents + tools (streamed)
-        Gemini-->>Agent: thoughts + function calls
-        Agent-->>UI: thought_*, step_start (per call)
-        par tool calls run concurrently
-            Agent->>Data: get_weather / find_activities / find_food
-        end
-        Agent-->>UI: step_end (per call)
-        Agent->>Gemini: function responses
+    loop until submit_plan accepted (max 8 turns, 240 s)
+        Agent->>LLM: messages + tools (candidates already included)
+        LLM-->>Agent: reasoning + tool calls (usually submit_plan)
+        Agent-->>UI: thought_*, step_start / step_end
+        Agent->>LLM: tool results (validation errors to fix)
     end
 
     Agent-->>UI: plan (+ warnings), done
@@ -114,7 +114,7 @@ sequenceDiagram
 | 1. `parse_preferences` | Normalise the input into a typed `Preferences` object: city, area, budget, currency, minutes, start time, mood, **energy level**, interests, **hard vs soft constraints**, assumptions. Decides whether to ask clarifying questions: in chat mode a code check (`missing_details`) asks for any missing city, budget, time or mood instead of assuming, with quick-pick options. Time windows are clamped to end by 23:00. Specific wishes ("bowling", "beer", "north indian") are kept alongside the model's broader labels. | `gemini-2.5-flash-lite` via AI Gateway (then gpt-oss, then the Gemini API), laid over a rule-based reading |
 | 2. `resolve_location` | Geocode the city (the most populous match) and neighbourhood (the match nearest the city). An unknown city becomes a clarifying question. | No |
 | 3. Gather | Weather, activity candidates and food candidates, fetched **by code in parallel** (live API data first; curated places only fill gaps). | No |
-| 4. Plan + revise | The model plans from the gathered candidates and calls `submit_plan` directly; the server repairs timing, validates, and returns real problems for one revision. It can still call the search tools for genuine gaps (max 2 searches). | AI Gateway (`gpt-oss-120b` on Cerebras/Groq), then Gemini |
+| 4. Plan + revise | The model plans from the gathered candidates and calls `submit_plan` directly; the server repairs timing, validates, and returns real problems for one revision. It can still call the search tools for genuine gaps (max 2 searches). | AI Gateway (`gpt-oss-120b` on Cerebras/Groq, then other gateway models), then the rule-based plan |
 
 Parsing is a separate, cheap call on purpose. It keeps clarification logic out of the planning loop, and the loop always starts from clean, validated preferences.
 
@@ -167,27 +167,17 @@ stateDiagram-v2
 
 ## 5. Model strategy
 
-**Provider chain:** Vercel AI Gateway → Gemini API → rule-based planner. Each stage hands the next one the work gathered so far (forecast, places found, last draft), so nothing is fetched twice.
+**Provider chain:** Vercel AI Gateway models → rule-based planner. The rule-based planner reuses everything already gathered (forecast, places, last draft), so nothing is fetched twice.
 
 | Stage | Models (in order) | Auth | Notes |
 |---|---|---|---|
-| Vercel AI Gateway | `openai/gpt-oss-120b` → `google/gemini-2.5-flash-lite` → `alibaba/qwen3.7-flash` (all free-tier eligible, all tested end to end) | The project's **OIDC token** on Vercel (no key to manage); `AI_GATEWAY_API_KEY` locally | OpenAI-format JSON history, so switching models mid-run is safe; ≈ $0.005 per plan on gpt-oss-120b |
-| Gemini API | the table below | `GEMINI_API_KEY` | Used when the gateway is unavailable |
-| Rules | none | none | Same tools and validator, no LLM |
+| Parsing | `google/gemini-2.5-flash-lite` → `openai/gpt-oss-120b` → `openai/gpt-oss-20b`, temperature 0 | The project's **OIDC token** on Vercel (no key to manage); `AI_GATEWAY_API_KEY` locally | Flash-Lite answered in ~1.2–2.5 s every time in testing; gpt-oss-20b varied from 3 to 13 s by provider |
+| Agent loop | `openai/gpt-oss-120b` (Cerebras/Groq first) → `google/gemini-2.5-flash-lite` → `alibaba/qwen3.7-flash` | same | OpenAI-format JSON history, so switching models mid-run is safe; ≈ $0.005 per plan on gpt-oss-120b |
+| Rules | none | none | Same tools and validator, no LLM; also reachable on purpose with `"simulate": ["llm_down"]` |
 
-The gateway was added after Gemini's free tier returned 503 "high demand" for every model for hours during testing. The direct Gemini path is unchanged:
+All models are on AI Gateway's free tier and configurable with `AI_GATEWAY_MODELS` and `AI_GATEWAY_PARSE_MODELS`. A busy or rate-limited model is retried once, then the run switches to the next model with the same history. Each agent turn times out after 45 s.
 
-
-| Use | Default model | Thinking | Why |
-|---|---|---|---|
-| Preference parsing | `gemini-3.5-flash-lite` | `low` | Fast, cheap, reliable structured JSON |
-| Agent loop | chain: `gemini-3.5-flash-lite` → `gemini-3.8-flash` → `gemini-4-hydrogen` | `low` (Hydrogen: `medium`) | During testing the larger models often returned 503 "high demand"; Flash-Lite answered in ~1–2 s |
-
-All of it is configurable with `GEMINI_MODELS` and `GEMINI_PARSE_MODEL`.
-
-**Thought signatures.** Gemini 3+/4 attach signatures to function-call parts and require them back in the next request. The loop appends the model's parts **exactly as streamed**, empty parts included, and never merges them.
-
-**Why model switching only happens before the first good turn:** the signatures tie the conversation history to the model that produced them. After the first good turn, failures are retried on the same model with backoff. If that still fails, the run **hands off** to the next model: a fresh conversation seeded with the forecast, every place found so far (their `place_id`s stay valid because they live in the run's registry) and the last draft. Only when no models are left does it drop to the rule-based planner, which reuses the same tools. Agent turns time out after 20 s, so an overloaded model fails fast.
+An earlier version also called the Gemini API directly as a second provider. It was removed: its free tier mostly returned 503 "high demand" during testing, so the gateway's own model chain plus the rule-based planner covered the same failures with less code.
 
 ---
 
@@ -220,7 +210,7 @@ Costs come from `estimate_cost`: per-category price heuristics (INR for India, a
 
 ### 7.1 Places provider chain
 
-**Live first.** Places come from a live API: **Geoapify Places** when `GEOAPIFY_API_KEY` is set (OpenStreetMap data with its tags attached, one request per category, spaced to stay under 5 requests/s, 20 places per request = 1 credit of the free 3,000/day, cached 30 min), otherwise Overpass and Photon racing each other. Neighbourhoods are geocoded the same way (Geoapify, then built-in anchors, Open-Meteo and Photon).
+**Live first.** Places come from a live API: **Geoapify Places** when `GEOAPIFY_API_KEY` is set (OpenStreetMap data with its tags attached, one request per category, spaced to stay under 5 requests/s, 20 places per request = 1 credit of the free 3,000/day, cached 30 min), otherwise Photon (keyless OpenStreetMap search). Neighbourhoods are geocoded the same way (Geoapify, then built-in anchors, Open-Meteo and Photon).
 
 Three refinements make live results fit the request:
 
@@ -236,15 +226,9 @@ flowchart TD
     Q["find_activities / find_food"] --> GEO{"GEOAPIFY_API_KEY?"}
     GEO -- "yes" --> GA["Geoapify Places<br/>per category, ≤ 5 req/s<br/>OSM tags: hours, diet, cuisine"]
     GA -- "results (even empty)" --> F
-    GA -- "error / bad key" --> PAR
-    GEO -- "no" --> PAR{{"query in parallel"}}
-    PAR --> OV["Overpass<br/>5 s timeout<br/>rich tags: hours, diet, cuisine"]
-    PAR --> PH["Photon<br/>≤ 3 concurrent, retry on 503<br/>names, addresses, coordinates"]
-    OV -- "results" --> PICK["prefer Overpass"]
-    OV -- "fail → 10 min cooldown" --> PH2["use Photon results"]
-    PH --> PH2
-    PICK --> F["filter: indoor, diet, price<br/>dedupe, score, diversify"]
-    PH2 --> F
+    GA -- "error / bad key" --> PH
+    GEO -- "no" --> PH["Photon<br/>≤ 3 concurrent, retry on 503<br/>names, addresses, coordinates"]
+    PH --> F["filter: indoor, diet, price<br/>dedupe, score, diversify"]
     F -- "< 4 results" --> WIDEN["widen radius ×2 once"] --> F
     F --> ENR["enrich live matches<br/>with curated price/hours/veg"]
     ENR -- "≥ 6 places, every category covered" --> OUT["return 'live'"]
@@ -252,8 +236,8 @@ flowchart TD
     CUR -- "unknown city" --> GEN["honest generic suggestions"] --> OUT3["return 'generic'"]
 ```
 
-- **Why Geoapify first:** the public OSM servers are free but best-effort (Photon was blocked from one development machine; Overpass is often at capacity). Geoapify serves the same OSM data with a real SLA and a free tier that covers this demo many times over.
-- **Why two keyless sources as backup:** the public Overpass servers were frequently at capacity during development ("all query workers are busy"). Photon answers in under a second but has no opening-hours or diet tags, so validation is more cautious with its results.
+- **Why Geoapify first:** the public OSM servers are free but best-effort (Photon was blocked from one development machine for a while). Geoapify serves the same OSM data with a real SLA and a free tier that covers this demo many times over.
+- **Why Photon as the keyless backup:** it answers in under a second, so the app still works locally without a Geoapify key. It has no opening-hours or diet tags, so validation is more cautious with its results. Overpass (richer tags) was tried too and removed: the public servers were at capacity in almost every test.
 - **Vegetarian heuristics** for untagged places: names with "veg", "vegetarian" or "vegan" count as veg. Names like "Sagar", "Bhavan", "Udupi" or "Darshini" are likely veg but marked *unverified*. Names with meat words are excluded.
 - **Crowd heuristic:** a per-category baseline, raised one level for well-known places (Wikidata or Wikipedia tags).
 
@@ -273,7 +257,7 @@ Each event is `data: <json>\n\n`. A `: keep-alive` comment goes out every 3 s of
 | Event | Payload | UI use |
 |---|---|---|
 | `step_start` | `id, name, label, input` | New trace row with a spinner |
-| `step_end` | `id, ok, summary, source, ms, output` | Tick or cross, timing, `live`/`fallback`/`gemini`/`rules` badge; expandable input and output JSON |
+| `step_end` | `id, ok, summary, source, ms, output` | Tick or cross, timing, `live`/`curated`/`gateway`/`rules` badge; expandable input and output JSON |
 | `thought_start` / `thought_delta` | `block, kind` / `block, text` | "Thinking with <model>…" and any thought summaries, streamed |
 | `status` | `message, tone` | Model switches, retries, fallback notices |
 | `preferences` | parsed `Preferences` | "What I understood" chips |
@@ -297,12 +281,10 @@ data: {"type":"step_end","id":"s4","ok":true,"summary":"10 food spots (live Open
 |---|---|---|---|
 | Missing details (chat mode) | `missing_details` on the user's own words | Ask for exactly the missing city / budget / time / mood (quick picks + free text), once each; then re-run with the answers | Question card |
 | Unknown city | geocoder returns nothing | Clarifying question | Question card |
-| Gemini overloaded / rate-limited (first turn) | 503, 429, timeout | Next model in the chain | ℹ️ status in the trace |
-| Gemini overloaded mid-run | same | 2 retries on the same model, then hand off to the next model with a summary of the work so far, then the rule-based plan | ℹ️ / ⚠️ status |
-| Gemini parse fails | any exception or 12 s per-model timeout (20 s total budget) | Next model, then the rule-based parser (reads form, free text and answers) | `RULES` badge |
-| Gemini unavailable (bad key, outage) | API error | Rule-based plan using the same tools and validator | "Rule-based backup plan" label |
-| Geoapify key missing, rejected or API down | no key, 401/403, errors | Overpass/Photon race; a rejected key is skipped for 5 min | `live`, trace names the source |
-| Overpass at capacity | HTTP error or timeout | Photon results; Overpass skipped for 10 min | `live` (Photon) |
+| AI Gateway model busy or rate-limited | 503, 429, timeout | One retry, then the next gateway model with the same history | ℹ️ status in the trace |
+| Every gateway model fails (or no gateway credentials) | errors from each model | Rule-based plan using the same tools and validator | "Rule-based backup plan" label, `RULES` badge |
+| Parsing fails | any exception or 10 s per model (20 s total budget) | Next parse model, then the rule-based parser (reads form, free text and answers) | `RULES` badge |
+| Geoapify key missing, rejected or API down | no key, 401/403, errors | Photon; a rejected key is skipped for 5 min | `live`, trace names the source |
 | Thin live results | < 4 places, or a category with none | Widen radius once, then fill from curated, then generic | "N live, M curated" in the trace; `Curated` badge per stop |
 | Weather API down | exception | Plan for uncertainty; plan B covers rain | Trace summary |
 | Invalid tool input from the model | Pydantic validation | Error returned as the function response; the model retries | ✕ in the trace |
@@ -349,7 +331,7 @@ The UI is fully client-side and reads the stream with `fetch` and a `ReadableStr
 ```
 
 - **Runtime limits:** Vercel Hobby with Fluid compute allows 300 s per function. The agent caps itself at 240 s. Python functions support streaming responses.
-- **Secrets:** `GEMINI_API_KEY` lives only in Vercel environment variables (and in a gitignored `backend/.env` locally). It's never sent to the browser.
+- **Secrets:** `GEOAPIFY_API_KEY` lives only in Vercel environment variables (and in a gitignored `backend/.env` locally); AI Gateway uses the project's OIDC token on Vercel. Neither reaches the browser.
 - **Local dev:** `uvicorn` on :8000. Next.js dev rewrites `/api/*` to it, matching production routing.
 
 ---
@@ -366,7 +348,7 @@ The UI is fully client-side and reads the stream with `fetch` and a `ReadableStr
 
 ## 13. Trade-offs and known limitations
 - **Estimates, not facts:** prices and crowds are heuristics, and Photon results lack opening hours. The UI says so everywhere.
-- **Public APIs are best-effort:** Overpass and the larger Gemini models were often overloaded during development. The fallback chains are the main mitigation.
+- **Public APIs are best-effort:** free-tier models and public map servers were sometimes overloaded during development. The fallback chains are the main mitigation.
 - **One person, one afternoon:** no group logic, multi-day plans or bookings.
 - **Per-instance state:** the rate limiter and caches don't persist across serverless instances.
 
@@ -387,11 +369,12 @@ docs/SYSTEM_DESIGN.md            this document
 frontend/                        Next.js app (web service)
 backend/main.py                  FastAPI app: /api/plan (SSE), /api/plan/{run_id}, /api/map, /api/health
 backend/planner/agent.py         agent loop, model chain, rule-based plan
-backend/planner/parse.py         parse_preferences (Gemini + rules)
+backend/planner/gateway.py       Vercel AI Gateway client and model chains
+backend/planner/parse.py         parse_preferences (AI Gateway + rules)
 backend/planner/prompts.py       system prompts
 backend/planner/tools.py         tool schemas, execution, final plan assembly
 backend/planner/checks.py        estimate_cost, validate_plan, RunContext
-backend/planner/places.py        Geoapify + Overpass + Photon, curated enrichment/fill, generic
+backend/planner/places.py        Geoapify + Photon, curated enrichment/fill, generic
 backend/planner/geo.py           geocoding, distance, travel legs
 backend/planner/maps.py          route map images (Geoapify Static Maps behind signed URLs)
 backend/planner/weather.py       Saturday forecast

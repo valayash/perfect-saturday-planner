@@ -251,7 +251,7 @@ export default function Planner() {
       </div>
 
       <footer className="mt-10 text-center text-xs text-muted">
-        Built with open models on Vercel AI Gateway (Cerebras/Groq), Gemini as backup, OpenStreetMap and Open-Meteo. Place data © OpenStreetMap contributors.
+        Built with open models on Vercel AI Gateway (Cerebras/Groq), Geoapify and OpenStreetMap places, and Open-Meteo weather. Place data © OpenStreetMap contributors.
       </footer>
     </div>
   );

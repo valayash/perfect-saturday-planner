@@ -18,9 +18,7 @@ const ICONS: Record<string, string> = {
 
 const SOURCE_STYLE: Record<string, string> = {
   live: "bg-ok-soft text-ok",
-  gemini: "bg-accent-soft text-accent",
   gateway: "bg-accent-soft text-accent",
-  fallback: "bg-warn-soft text-warn",
   curated: "bg-ink text-bg",
   generic: "bg-warn-soft text-warn",
   rules: "bg-warn-soft text-warn",

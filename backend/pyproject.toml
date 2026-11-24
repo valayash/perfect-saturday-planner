@@ -1,11 +1,11 @@
 [project]
 name = "saturday-planner-api"
 version = "0.1.0"
-description = "Perfect Saturday Planner agent API (FastAPI + Gemini)"
+description = "Perfect Saturday Planner agent API (FastAPI + Vercel AI Gateway)"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.165.0",
-    "google-genai>=3.6.1",
+    "httpx2>=2.16.2",
     "openai>=3.58.0",
     "tzdata>=2026.6",
 ]

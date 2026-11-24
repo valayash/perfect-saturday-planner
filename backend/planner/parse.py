@@ -1,16 +1,13 @@
-"""parse_preferences: structured output via AI Gateway or Gemini, with a rule-based fallback."""
+"""parse_preferences: structured output via AI Gateway, with a rule-based fallback."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 
-from google import genai
-from google.genai import types
 from openai import AsyncOpenAI
 
 from .fallback_data import CITY_KEYS
@@ -196,7 +193,6 @@ def _request_text(req: PlanRequest) -> str:
     return "\n\n".join(parts)
 
 
-PARSE_MODEL = os.getenv("GEMINI_PARSE_MODEL", "gemini-3.5-flash-lite")
 PARSE_BUDGET_S = 20
 
 
@@ -227,42 +223,14 @@ async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: 
     return None
 
 
-async def parse_preferences(
-    client: genai.Client | None, req: PlanRequest, gateway: AsyncOpenAI | None = None, meta: dict | None = None
-) -> tuple[Preferences, str]:
-    """Returns (preferences, source) where source is 'gateway', 'gemini' or 'rules'. Fills meta with model and tokens."""
+async def parse_preferences(req: PlanRequest, gateway: AsyncOpenAI | None = None, meta: dict | None = None) -> tuple[Preferences, str]:
+    """Returns (preferences, source) where source is 'gateway' or 'rules'. Fills meta with model and tokens."""
     meta = meta if meta is not None else {}
-    fallbacks = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-4-hydrogen").split(",") if m.strip()]
     prefs, source = None, "rules"
     deadline = time.monotonic() + PARSE_BUDGET_S  # an overloaded model should cost seconds, not a minute
     if gateway:
         prefs = await _parse_with_gateway(gateway, req, deadline, meta)
         source = "gateway" if prefs else "rules"
-    models = dict.fromkeys([PARSE_MODEL, *fallbacks]) if client and not prefs else {}  # fast model first, then the chain
-    for model in models:
-        remaining = deadline - time.monotonic()
-        if remaining < 3:
-            break
-        try:
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=model,
-                    contents=_request_text(req),
-                    config=types.GenerateContentConfig(
-                        system_instruction=PARSE_SYSTEM,
-                        response_mime_type="application/json",
-                        response_json_schema=Preferences.model_json_schema(),
-                        thinking_config=types.ThinkingConfig(thinking_level="low"),
-                        http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1)),
-                    ),
-                ),
-                timeout=min(remaining, 12),
-            )
-            prefs, source = Preferences.model_validate_json(response.text or ""), "gemini"
-            meta.update(model=model, tokens=getattr(response.usage_metadata, "total_token_count", 0) or 0)
-            break
-        except Exception as err:  # overloaded, timed out, bad key, malformed JSON...: try the next model, then rules
-            log.warning("parse_preferences failed on %s: %s", model, (str(err) or type(err).__name__)[:200])
     if prefs is None:
         prefs = heuristic_preferences(req)
 
