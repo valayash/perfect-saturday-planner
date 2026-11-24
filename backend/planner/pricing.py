@@ -13,6 +13,7 @@ CATEGORIES: dict[str, tuple[str, bool, str, float, float]] = {
     "garden": ("activity", False, "low", 0, 0),
     "lake": ("activity", False, "medium", 0, 0),
     "viewpoint": ("activity", False, "medium", 0, 0),
+    "beach": ("activity", False, "high", 0, 0),
     "museum": ("activity", True, "medium", 150, 15),
     "gallery": ("activity", True, "low", 0, 0),
     "arts_centre": ("activity", True, "low", 200, 10),

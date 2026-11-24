@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
 
 import httpx2
@@ -13,6 +14,7 @@ from .pricing import travel_rates
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 PHOTON_URL = "https://photon.komoot.io/api/"
+GEOAPIFY_GEOCODE_URL = "https://api.geoapify.com/v1/geocode/search"
 USER_AGENT = "perfect-saturday-planner/1.0 (take-home demo)"
 
 # Common alternate names the geocoder handles poorly.
@@ -46,12 +48,19 @@ CITY_ANCHOR_KEYS = {"bengaluru": "bengaluru", "bangalore": "bengaluru", "mumbai"
                     "new delhi": "delhi", "pune": "pune", "gurugram": "gurugram", "gurgaon": "gurugram"}
 
 
+def _display(area: str) -> str:
+    """The user's own spelling when they used capitals ("HSR Layout"), otherwise title case."""
+    area = area.strip()
+    return area if any(ch.isupper() for ch in area) else area.title()
+
+
 def _anchor(city: Location, area: str) -> Location | None:
     key = CITY_ANCHOR_KEYS.get(city.name.strip().lower())
-    hit = AREA_ANCHORS.get(key or "", {}).get(re.sub(r"\s+", " ", area.strip().lower()))
+    squash = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())  # noqa: E731  ("CyberHub" == "Cyber Hub")
+    hit = next((v for k, v in AREA_ANCHORS.get(key or "", {}).items() if squash(k) == squash(area)), None)
     if not hit:
         return None
-    name = area.strip().title()
+    name = _display(area)
     return city.model_copy(update={"name": name, "lat": hit[0], "lon": hit[1], "label": f"{name}, {city.label}"})
 
 
@@ -97,7 +106,10 @@ async def resolve_location(city: str, area: str | None, country_code: str | None
         best = max(results, key=lambda r: (r.get("population") or 0))
         city_loc = _to_location(best)
 
+        # Built-in anchors first: they settle what people usually mean ("Bandra" is Bandra West, not BKC).
         area_loc = _anchor(city_loc, area) if area else None
+        if area and not area_loc:
+            area_loc = await _geoapify_area(client, area.strip(), city_loc)
         if area and not area_loc:
             try:
                 candidates = await _search(client, area.strip(), city_loc.country_code or None)
@@ -108,7 +120,50 @@ async def resolve_location(city: str, area: str | None, country_code: str | None
                 area_loc = _to_location(min(near, key=lambda c: haversine_km(city_loc.lat, city_loc.lon, c["latitude"], c["longitude"])))
             else:  # Open-Meteo only knows populated places; Photon also knows markets, landmarks and suburbs
                 area_loc = await _photon_area(client, area.strip(), city_loc)
+        if not area:
+            area_loc = default_centre(city_loc)
     return city_loc, area_loc
+
+
+# Where to start when no neighbourhood is given and the geocoder's "centre" is off to one side of where people go out.
+DEFAULT_CENTRES = {
+    "gurugram": ("central Gurugram", 28.4800, 77.0800),  # between Sector 29, Galleria and CyberHub
+    "delhi": ("Connaught Place", 28.6315, 77.2167),
+    "mumbai": ("Dadar", 19.0178, 72.8478),  # between Bandra and South Mumbai
+}
+
+
+def default_centre(city: Location) -> Location | None:
+    hit = DEFAULT_CENTRES.get(CITY_ANCHOR_KEYS.get(city.name.strip().lower(), ""))
+    if not hit:
+        return None
+    name, lat, lon = hit
+    return city.model_copy(update={"name": name, "lat": lat, "lon": lon, "label": f"{name}, {city.label}"})
+
+
+async def _geoapify_area(client: httpx2.AsyncClient, area: str, city: Location) -> Location | None:
+    """Neighbourhoods, markets and landmarks via Geoapify geocoding (when GEOAPIFY_API_KEY is set)."""
+    key = os.environ.get("GEOAPIFY_API_KEY")
+    if not key:
+        return None
+    params = {"text": f"{area}, {city.name}", "bias": f"proximity:{city.lon:.5f},{city.lat:.5f}", "limit": 3, "format": "json", "lang": "en", "apiKey": key}
+    if city.country_code:
+        params["filter"] = f"countrycode:{city.country_code.lower()}"
+    try:
+        resp = await client.get(GEOAPIFY_GEOCODE_URL, params=params, timeout=4.0)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except (httpx2.HTTPError, ValueError):
+        return None
+    results = [r for r in results if r.get("result_type") not in ("city", "state", "country", "county")]  # matched the city, not the area
+    results.sort(key=lambda r: r.get("result_type") == "street")  # "Cyber Hub" the landmark, not the flyover named after it
+    for r in results:
+        lat, lon = r.get("lat"), r.get("lon")
+        if lat is not None and lon is not None and haversine_km(city.lat, city.lon, lat, lon) < 35:
+            # Neighbourhood names are canonical ("Bandra" -> "Bandra West"); for landmarks keep the user's words.
+            name = r.get("name") if r.get("result_type") in ("suburb", "district", "postcode") and r.get("name") else _display(area)
+            return city.model_copy(update={"name": name, "lat": lat, "lon": lon, "label": f"{name}, {city.label}"})
+    return None
 
 
 async def _photon_area(client: httpx2.AsyncClient, area: str, city: Location) -> Location | None:

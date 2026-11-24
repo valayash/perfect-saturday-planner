@@ -22,6 +22,9 @@ class RunContext:
     center: Location
     places: dict[str, Place] = field(default_factory=dict)
     weather: dict | None = None
+    wanted: set[str] = field(default_factory=set)  # place categories the user explicitly asked for (e.g. bowling, bar)
+    hints: list[str] = field(default_factory=list)  # facts from data gathering the model should know (e.g. a far-off match)
+    cuisine: str | None = None  # a cuisine the user asked for ("north indian")
 
     @property
     def vegetarian(self) -> bool:
@@ -35,6 +38,24 @@ class RunContext:
     @property
     def start_label(self) -> str:
         return self.center.name if self.center is not self.city else f"{self.city.name} centre"
+
+
+def canonical_place_id(ctx: RunContext, pid: str) -> str:
+    """Map a slightly mis-copied place_id onto the known place it means.
+
+    Models sometimes swap the OSM type letter ("osm:n123" for "osm:w123") or pass the place's name.
+    Returns the id unchanged when there is no single clear match (validation then reports it).
+    """
+    if pid in ctx.places:
+        return pid
+    m = re.fullmatch(r"osm:[a-z]?(\d+)", pid.strip())
+    if m:
+        hits = [k for k in ctx.places if re.fullmatch(rf"osm:[a-z]?{m.group(1)}", k)]
+        if len(hits) == 1:
+            return hits[0]
+    name = re.sub(r"\s+", " ", pid).strip().lower()
+    hits = [k for k, p in ctx.places.items() if p.name.lower() == name]
+    return hits[0] if len(hits) == 1 else pid
 
 
 class StopIn(BaseModel):
@@ -157,6 +178,11 @@ def validate_plan(ctx: RunContext, stops: list[StopIn]) -> dict:
     if not rows:
         errors.append("The plan has no valid stops.")
         return {"ok": False, "errors": errors, "warnings": warnings}
+    seen: set[str] = set()
+    for r in rows:
+        if r["place"].id in seen:
+            errors.append(f"{r['place'].name} appears twice. Every stop must be a different place: pick another option from the candidates.")
+        seen.add(r["place"].id)
 
     window_start = to_min(p.start_time)
     window_end = window_start + p.available_minutes

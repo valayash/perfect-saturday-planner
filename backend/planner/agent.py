@@ -25,8 +25,9 @@ from openai import AsyncOpenAI
 from .checks import RunContext, StopIn, to_hhmm, to_min, validate_plan
 from .gateway import GATEWAY_MODELS, OPENAI_TOOLS, error_text, gateway_client, is_account_problem, is_busy, request_options
 from .geo import ALIASES, GeocodeError, haversine_km, resolve_location, travel_leg
-from .models import PlanRequest
+from .models import Place, PlanRequest
 from .parse import parse_preferences
+from .places import cuisine_wish
 from .prompts import AGENT_SYSTEM
 from .tools import TOOL_SPECS, FinalStop, PlanB, SubmitIn, build_final_plan, run_tool
 
@@ -119,9 +120,11 @@ def _seed_message(ctx: RunContext, last_draft: dict | None) -> str:
     data = {
         "weather": weather if ctx.weather else "unavailable: plan for uncertain weather",
         "activity_candidates": [brief(p) for p in ctx.places.values() if p.kind == "activity"][:20],
-        "food_candidates": [brief(p) for p in ctx.places.values() if p.kind == "food"][:16],
+        "food_candidates": [brief(p) for p in ctx.places.values() if p.kind == "food"][:20],
         "travel_rule_of_thumb": "between two stops allow ~6 min plus ~3-4 min per km by auto/cab; walking under ~1 km",
     }
+    if ctx.hints:
+        data["notes"] = ctx.hints
     if last_draft:
         data["previous_draft"] = last_draft
     return (
@@ -160,6 +163,15 @@ async def _run_calls(ctx: RunContext, steps: _Steps, state: LoopState, calls: li
             state.final_plan = out.final_plan or state.final_plan
 
 
+def _far_wanted(ctx: RunContext, radius_km: float = 5) -> Place | None:
+    """The nearest match for an activity the user asked for by name, when every match is beyond the search radius."""
+    for cat in sorted(ctx.wanted):
+        matches = [p for p in ctx.places.values() if p.kind == "activity" and p.category == cat]
+        if matches and min(p.distance_km for p in matches) > radius_km:
+            return min(matches, key=lambda p: p.distance_km)
+    return None
+
+
 def _gather_calls(ctx: RunContext) -> list[tuple[None, str, dict]]:
     """The data every plan needs, fetched by code in parallel before the model is involved."""
     p = ctx.prefs
@@ -170,7 +182,8 @@ def _gather_calls(ctx: RunContext) -> list[tuple[None, str, dict]]:
     return [
         (None, "get_weather", {}),
         (None, "find_activities", {"categories": activity_cats, "radius_km": 5}),
-        (None, "find_food", {"categories": food_cats, "radius_km": 3.5, "max_price_per_person": round(p.budget * 0.6)}),
+        (None, "find_food", {"categories": food_cats, "radius_km": 3.5, "max_price_per_person": round(p.budget * 0.6)}
+         | ({"cuisine": ctx.cuisine} if ctx.cuisine else {})),
     ]
 
 
@@ -224,11 +237,30 @@ async def run(req: PlanRequest, oidc_token: str | None = None) -> AsyncIterator[
     yield steps.end(sid, t0, note, source="live", output={"city": city.model_dump(), "area": area.model_dump() if area else None})
     if prefs.currency in ("local", "") and city.country_code == "IN":
         prefs.currency = "INR"
+    if area and not prefs.area:
+        prefs.assumptions.append(f"No neighbourhood given, so the plan starts from {area.name}.")
     ctx = RunContext(prefs=prefs, city=city, center=area or city)
+    ctx.wanted = set(_categories_for(prefs.interests, rainy=False, default=False)) | set(_food_categories(prefs)[2:])
+    ctx.cuisine = cuisine_wish(" ".join([*prefs.interests, req.free_text or "", *(c.answer for c in req.clarifications)]))
+    if "live_music" in ctx.wanted:
+        ctx.hints.append("Map data has no live-music venue type, so theatres and arts centres stand in. Don't promise live music at a "
+                         "place unless its name or note says so; say it's worth checking listings, or note it as a trade-off.")
 
     # 3. gather weather and candidates (code, in parallel)
     async for e in _run_calls(ctx, steps, state, _gather_calls(ctx)):
         yield e
+    # Something asked for by name is only found far away: gather food around it too, so the model can build
+    # the outing there instead of pairing it with stops across town.
+    if far := _far_wanted(ctx):
+        ctx.hints.append(
+            f"The only {far.category.replace('_', ' ')} found is {far.name}, {far.distance_km:.0f} km from the user's area. Food candidates "
+            "near it are included: either build the outing around it (all stops near it) or leave it out and say why in tradeoffs."
+        )
+        food_args = {"categories": _food_categories(ctx.prefs), "radius_km": 2.5, "near_place_id": far.id, "max_price_per_person": round(ctx.prefs.budget * 0.6)}
+        if ctx.cuisine:
+            food_args["cuisine"] = ctx.cuisine
+        async for e in _run_calls(ctx, steps, state, [(None, "find_food", food_args)]):
+            yield e
 
     # 4. plan + revise (LLM agent): AI Gateway, then Gemini, then rules
     stages = []
@@ -534,25 +566,27 @@ async def _rule_based_plan(ctx: RunContext, steps: _Steps, reason: str) -> Async
 
 INTEREST_CATEGORIES: list[tuple[tuple[str, ...], str]] = [
     (("bowling",), "bowling"), (("arcade", "gaming", "video game", "game"), "arcade"), (("escape",), "escape_room"),
-    (("music", "gig", "concert", "jazz", "band", "dj"), "live_music"), (("comedy", "stand-up", "standup", "theatre", "theater", "play"), "theatre"),
+    (("music", "gig", "concert", "jazz", "band", "dj"), "live_music"), (("comedy", "stand-up", "standup", "theatre", "theater", "drama"), "theatre"),
     (("movie", "film", "cinema"), "cinema"), (("art", "painting", "gallery"), "gallery"), (("culture", "workshop", "talk"), "arts_centre"),
     (("museum", "science"), "museum"), (("history", "heritage", "monument", "fort", "palace"), "historic"),
     (("book", "read"), "bookstore"), (("library",), "library"), (("walk", "nature", "outdoor", "park", "green"), "park"),
     (("lake", "water"), "lake"), (("garden", "flower"), "garden"), (("view", "sunset"), "viewpoint"),
+    ((r"sea\b", "beach", "ocean", "promenade", "coast", "seaside", "seaface"), "beach"),
     (("sport", "climb", "badminton", "football", "cricket", "gym", "swim"), "sports"), (("shopping", "mall"), "mall"),
     (("market", "flea", "bazaar"), "market"), (("spa", "massage"), "spa"), (("fun",), "arcade"),
 ]
 
 
-def _categories_for(interests: list[str], rainy: bool) -> list[str]:
+def _categories_for(interests: list[str], rainy: bool, default: bool = True) -> list[str]:
     text = " ".join(interests).lower()
     cats = []
-    for words, cat in INTEREST_CATEGORIES:
-        if any(w in text for w in words) and cat not in cats:
+    for words, cat in INTEREST_CATEGORIES:  # words match at the start of a word: "art" is not "party", "sea" is not "seafood"
+        if re.search(rf"\b(?:{'|'.join(words)})", text) and cat not in cats:
             cats.append(cat)
     if rainy:
-        cats = [c for c in cats if c not in ("park", "lake", "garden", "viewpoint")] + ["bookstore", "museum"]
-    return (cats or ["park", "bookstore", "gallery"])[:6]
+        cats = [c for c in cats if c not in ("park", "lake", "garden", "viewpoint", "beach")]
+        cats += [c for c in ("bookstore", "museum") if c not in cats]
+    return (cats or (["park", "bookstore", "gallery"] if default else []))[:6]
 
 
 def _food_categories(prefs) -> list[str]:

@@ -4,10 +4,10 @@ import { useState } from "react";
 import type { Leg, Plan, PlanStop } from "../lib/types";
 
 const CATEGORY_ICON: Record<string, string> = {
-  park: "🌳", garden: "🌷", lake: "🌊", viewpoint: "🌅", museum: "🏛️", gallery: "🖼️", arts_centre: "🎭",
+  park: "🌳", garden: "🌷", lake: "🌊", viewpoint: "🌅", beach: "🏖️", museum: "🏛️", gallery: "🖼️", arts_centre: "🎭",
   live_music: "🎶", theatre: "🎭", cinema: "🎬", bookstore: "📚", library: "📖", market: "🛍️", mall: "🛍️",
   historic: "🏰", bowling: "🎳", arcade: "🕹️", escape_room: "🗝️", sports: "🏓", spa: "💆",
-  cafe: "☕", restaurant: "🍛", fast_food: "🥙", dessert: "🍨", street_food: "🌮",
+  cafe: "☕", restaurant: "🍛", fast_food: "🥙", dessert: "🍨", street_food: "🌮", bar: "🍺",
 };
 
 function money(n: number, currency: string) {

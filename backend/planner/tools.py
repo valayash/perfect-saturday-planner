@@ -8,15 +8,16 @@ from urllib.parse import quote_plus
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .checks import RunContext, StopIn, _rain_at, estimate_cost, itinerary, to_hhmm, to_min, trip_legs, validate_plan
+from .checks import RunContext, StopIn, _rain_at, canonical_place_id, estimate_cost, itinerary, to_hhmm, to_min, trip_legs, validate_plan
 from .geo import travel_leg
 from .hours import open_during
-from .places import find_places
+from .places import CUISINES, find_places
 from .pricing import ACTIVITY_CATEGORIES, FOOD_CATEGORIES
 from .weather import saturday_forecast
 
 ActivityCategory = Literal[tuple(ACTIVITY_CATEGORIES)]  # type: ignore[valid-type]
 FoodCategory = Literal[tuple(FOOD_CATEGORIES)]  # type: ignore[valid-type]
+Cuisine = Literal[tuple(CUISINES)]  # type: ignore[valid-type]
 
 
 # ---------- tool inputs ----------
@@ -37,6 +38,7 @@ class FoodIn(BaseModel):
     categories: list[FoodCategory] = Field(min_length=1, max_length=5, description="Food categories to search.")
     radius_km: float = Field(default=2.5, ge=0.5, le=10)
     max_price_per_person: float | None = Field(default=None, ge=0, description="Skip places estimated well above this.")
+    cuisine: Cuisine | None = Field(default=None, description="Favour a cuisine the user asked for.")
     near_place_id: str | None = Field(default=None, description="Search around this place, e.g. the activity before the meal.")
 
 
@@ -98,7 +100,7 @@ TOOL_SPECS = [
     _tool("get_weather", "Saturday's forecast for the user's city during their time window: hourly rain chance, temperature, sunset.", WeatherIn),
     _tool(
         "find_activities",
-        "Find real places to do things near the user (OpenStreetMap, with curated fallback). Returns place_ids with distance, "
+        "Find real places to do things near the user (live map data, with curated fallback). Returns place_ids with distance, "
         "indoor flag, estimated cost per person, crowd estimate and opening hours when known.",
         ActivitiesIn,
     ),
@@ -144,6 +146,7 @@ def _register(ctx: RunContext, places: list) -> None:
 
 
 def _center_for(ctx: RunContext, place_id: str | None):
+    place_id = canonical_place_id(ctx, place_id) if place_id else None
     if place_id and place_id in ctx.places:
         p = ctx.places[place_id]
         return ctx.center.model_copy(update={"lat": p.lat, "lon": p.lon, "name": p.name})
@@ -188,6 +191,8 @@ async def run_tool(ctx: RunContext, name: str, raw: Any, submit_attempts: int) -
             indoor_only=getattr(args, "indoor_only", False),
             max_price=getattr(args, "max_price_per_person", None),
             limit=10 if food else 12,
+            must_have=[c for c in args.categories if c in ctx.wanted],
+            cuisine=getattr(args, "cuisine", None),
         )
         _register(ctx, places)
         label = notes[0] if notes and "curated" in notes[0] else {"live": "live OpenStreetMap", "curated": "curated", "fallback": "curated", "generic": "generic fallback"}[source]
@@ -199,6 +204,10 @@ async def run_tool(ctx: RunContext, name: str, raw: Any, submit_attempts: int) -
         )
 
     if name in ("estimate_cost", "validate_plan", "submit_plan"):
+        for s in args.stops:
+            s.place_id = canonical_place_id(ctx, s.place_id)
+        if isinstance(args, SubmitIn) and args.plan_b:
+            args.plan_b.place_ids = [canonical_place_id(ctx, i) for i in args.plan_b.place_ids]
         args.stops = snap_schedule(ctx, args.stops)
 
     if name == "estimate_cost":

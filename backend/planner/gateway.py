@@ -22,8 +22,9 @@ def _models(env: str, default: str) -> list[str]:
 
 # Defaults are all on AI Gateway's free tier, support tool calling and JSON-schema output, and come from different families.
 GATEWAY_MODELS = _models("AI_GATEWAY_MODELS", "openai/gpt-oss-120b,google/gemini-2.5-flash-lite,alibaba/qwen3.7-flash")
-# Parsing is a small extraction job: a small model on fast hardware answers in well under a second.
-PARSE_MODELS = _models("AI_GATEWAY_PARSE_MODELS", "openai/gpt-oss-20b,openai/gpt-oss-120b,google/gemini-2.5-flash-lite")
+# Parsing is a small extraction job. Gemini 2.5 Flash-Lite answered in ~1.2-2.3 s every time in testing;
+# gpt-oss-20b varied from 3 to 13 s depending on which provider served it.
+PARSE_MODELS = _models("AI_GATEWAY_PARSE_MODELS", "google/gemini-2.5-flash-lite,openai/gpt-oss-120b,openai/gpt-oss-20b")
 # Open-weights models run on several providers; Cerebras and Groq serve them at hundreds of tokens per second.
 FAST_PROVIDERS = _models("AI_GATEWAY_FAST_PROVIDERS", "cerebras,groq")
 

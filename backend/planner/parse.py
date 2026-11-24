@@ -50,8 +50,11 @@ INDIAN_CITIES = set(CITY_KEYS) | {"pune", "hyderabad", "chennai", "kolkata", "ah
 INTEREST_WORDS = {
     "food": r"food|eat|restaurant|lunch|dinner|brunch", "coffee": r"coffee|caf[eé]", "music": r"music|gig|concert|jazz",
     "walks": r"walk|stroll|park|nature|outdoor", "art": r"\bart\b|gallery|museum", "books": r"book|read",
-    "history": r"histor|heritage|fort|palace", "movies": r"movie|film|cinema", "games": r"game|arcade|bowling",
-    "dessert": r"dessert|ice cream|sweet", "shopping": r"shop|market",
+    "history": r"histor|heritage|fort|palace", "movies": r"movie|film|cinema", "games": r"game|arcade",
+    "bowling": r"bowling", "escape room": r"escape room", "comedy": r"comedy|stand-?up",
+    "drinks": r"\bbeers?\b|\bdrinks\b|\bpubs?\b|brew|cocktail|\bwine\b|\bbars?\b",
+    "dessert": r"dessert|ice cream|sweet", "street food": r"street food|chaat", "shopping": r"shop|market",
+    "sea": r"\bsea\b|beach|ocean|promenade|seaside|sea ?face",
 }
 CONSTRAINT_WORDS = {"vegetarian": r"\bveg(etarian)?\b", "vegan": r"vegan", "jain food": r"\bjain\b", "avoid crowded places": r"crowd|quiet|calm", "no alcohol": r"no alcohol|sober|don'?t drink"}
 
@@ -83,6 +86,17 @@ def _split_city(text: str) -> tuple[str | None, str | None]:
     return city.strip() or None, area
 
 
+def keyword_interests(req: PlanRequest) -> list[str]:
+    """Interests from the form plus keywords in the user's own words, kept specific ("bowling", not just "games")."""
+    is_where = lambda q: bool(re.search(r"\bcity\b|where", q, re.I))  # noqa: E731
+    blob = " ".join([req.free_text or "", *(c.answer for c in req.clarifications if not is_where(c.question))])
+    interests = [i.strip().lower() for i in req.interests if i.strip()]
+    interests += [k for k, rx in INTEREST_WORDS.items() if k not in interests and re.search(rx, blob, re.I)]
+    if re.search(CONSTRAINT_WORDS["no alcohol"], blob, re.I) or any(re.search(r"alcohol", c, re.I) for c in req.constraints):
+        interests = [i for i in interests if i != "drinks"]  # "I don't drink" is not an interest in drinks
+    return interests
+
+
 def heuristic_preferences(req: PlanRequest) -> Preferences:
     """Rule-based parse used when the LLM is unavailable: the structured form, plus keywords from free text and answers."""
     is_where = lambda q: bool(re.search(r"\bcity\b|where", q, re.I))  # noqa: E731
@@ -108,8 +122,7 @@ def heuristic_preferences(req: PlanRequest) -> Preferences:
     minutes = _minutes(req.available_time or (blob if re.search(r"\d\s*(h|hour)|half day|full day", blob, re.I) else None))
     energy = _energy(f"{mood} {answers}")
     india = bool(city and city.lower() in INDIAN_CITIES) or bool(re.search(r"₹|rupee|\binr\b", blob, re.I))
-    interests = [i.strip().lower() for i in req.interests if i.strip()]
-    interests += [k for k, rx in INTEREST_WORDS.items() if k not in interests and re.search(rx, blob, re.I)]
+    interests = keyword_interests(req)
     cons = [c.strip() for c in req.constraints if c.strip()]
     cons += [k for k, rx in CONSTRAINT_WORDS.items() if k not in cons and re.search(rx, blob, re.I)]
     start = req.start_time or ("15:00" if energy == "low" and minutes <= 300 else "11:00" if minutes >= 360 else "14:00")
@@ -150,14 +163,25 @@ def coerce_preferences(text: str, req: PlanRequest) -> Preferences:
         data["available_minutes"] = _minutes(str(data["available_time"]))
     base = heuristic_preferences(req).model_dump()
     merged = {**base, **{k: v for k, v in data.items() if k in Preferences.model_fields and v not in (None, "")}}
-    interests = {str(i).lower() for i in merged.get("interests") or []}
+    # Small models generalise ("bowling and beer" -> "games"); keep the user's specific words alongside.
+    merged["interests"] = list(dict.fromkeys([str(i).lower() for i in merged.get("interests") or []] + keyword_interests(req)))[:12]
+    interests = set(merged["interests"])
     for key in ("hard_constraints", "soft_constraints"):  # small models sometimes copy interests in here
         merged[key] = [c for c in merged.get(key) or [] if str(c).lower() not in interests]
     if merged.get("city") and "needs_clarification" not in data:
         merged["needs_clarification"], merged["clarifying_questions"] = False, []
+    merged["assumptions"] = [a for a in merged.get("assumptions") or [] if _real_assumption(str(a))]
     if merged.get("country_code") == "IN" and merged.get("currency") in (None, "", "local"):
         merged["currency"] = "INR"
     return Preferences.model_validate(merged)
+
+
+def _real_assumption(text: str) -> bool:
+    """Small models list restatements ("Budget specified as 1500") as assumptions; keep only real guesses."""
+    if re.search(r"\bas (requested|specified|stated|mentioned|given|asked)\b", text, re.I):
+        return False
+    restates = re.search(r"\b(specified|provided|given|stated|mentioned|requested|means)\b", text, re.I)
+    return not restates or bool(re.search(r"\b(not|no|wasn't|isn't|without)\b", text, re.I))
 
 
 def _request_text(req: PlanRequest) -> str:
@@ -188,6 +212,7 @@ async def _parse_with_gateway(gateway: AsyncOpenAI, req: PlanRequest, deadline: 
                     messages=[{"role": "system", "content": PARSE_SYSTEM}, {"role": "user", "content": _request_text(req)}],
                     response_format={"type": "json_schema", "json_schema": {"name": "preferences", "schema": Preferences.model_json_schema()}},
                     max_tokens=4000,
+                    temperature=0,  # steadier readings: the same request no longer flips between "low" and "medium" energy
                     **request_options(model),
                 ),
                 timeout=min(remaining, 10),
@@ -256,6 +281,18 @@ async def parse_preferences(
             meta["questions"] = asks
         elif prefs.city:
             prefs.needs_clarification, prefs.clarifying_questions = False, []
+    # What the person actually stated wins over the model's reading (small models sometimes ignore "4 hours").
+    stated = " ".join(x for x in [req.available_time or "", req.free_text or ""] + [c.answer for c in req.clarifications] if x)
+    start, minutes = explicit_window(stated)
+    if req.start_time and re.fullmatch(r"\d{1,2}:\d{2}", req.start_time):
+        start = req.start_time
+    if start:
+        prefs.start_time = start
+    if minutes:
+        prefs.available_minutes = minutes
+    if start or minutes:  # the user gave their times, so notes about the start, end or duration aren't assumptions
+        timing = r"\b(start|starting|end|ending|until|duration|hours?|available time|time window)\b"
+        prefs.assumptions = [a for a in prefs.assumptions if not re.search(timing, a, re.I)]
     if not re.fullmatch(r"\d{1,2}:\d{2}", prefs.start_time) or not (6 * 60 <= _to_min(prefs.start_time) <= 22 * 60):
         prefs.start_time = "14:00"
     room = LATEST_END - _to_min(prefs.start_time)  # plans end by 23:00, whatever the model guessed
@@ -266,6 +303,60 @@ async def parse_preferences(
 
 
 LATEST_END = 23 * 60
+
+_CLOCK = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+
+
+def _clock(h: str, m: str | None, ampm: str | None, default_pm: bool) -> int:
+    hour, minute = int(h) % 24, int(m or 0)
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    elif ampm is None and default_pm and 1 <= hour <= 9:
+        hour += 12  # "from 4" on a Saturday outing means 4 pm
+    return hour * 60 + minute
+
+
+def explicit_window(text: str) -> tuple[str | None, int | None]:
+    """(start "HH:MM", minutes) the person stated explicitly, if any: "5–10 pm", "4 hours from 3pm", "half day"."""
+    t = text.lower()
+    rng = re.search(rf"\b{_CLOCK}\s*(?:-|–|—|to|till|until)\s*{_CLOCK}\b", t)
+    if rng and (rng.group(3) or rng.group(6)):
+        end_ampm = rng.group(6)
+        start_ampm = rng.group(3) or (end_ampm if end_ampm and int(rng.group(1)) <= int(rng.group(4)) else None)
+        a = _clock(rng.group(1), rng.group(2), start_ampm, default_pm=True)
+        b = _clock(rng.group(4), rng.group(5), end_ampm, default_pm=True)
+        if b <= a:
+            b += 12 * 60 if b + 12 * 60 > a else 24 * 60
+        if 30 <= b - a <= 14 * 60:
+            return f"{a // 60:02d}:{a % 60:02d}", b - a
+    minutes = None
+    hours = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b", t)
+    mins = re.search(r"(\d+)\s*(?:m|min|mins|minutes)\b", t)
+    if hours or mins:
+        minutes = int((float(hours.group(1)) * 60 if hours else 0) + (int(mins.group(1)) if mins else 0)) or None
+    elif re.search(r"half[- ]day|half a day", t):
+        minutes = 240
+    elif re.search(r"full[- ]day|whole day|all day", t):
+        minutes = 600
+    start = end = None
+    at = re.search(r"\b(?:from|at|after|starting|start at)\s+" + _CLOCK + r"\b", t)
+    until = re.search(r"\b(?:until|till|til|to|by|before)\s+" + _CLOCK + r"\b", t)
+    if not at:  # a bare "3pm" that isn't an end time ("until 10 pm")
+        for bare in re.finditer(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t):
+            if not until or bare.start() != until.start(1):
+                at = bare
+                break
+    if at:
+        m = _clock(at.group(1), at.group(2), at.group(3), default_pm=True)
+        if 6 * 60 <= m <= 22 * 60:
+            start = m
+    if until and (until.group(3) or start is not None):
+        end = _clock(until.group(1), until.group(2), until.group(3), default_pm=True)
+    if start is not None and end is not None and minutes is None and 30 <= end - start <= 14 * 60:
+        minutes = end - start
+    return (f"{start // 60:02d}:{start % 60:02d}" if start is not None else None), minutes
 
 # ---------- chat mode: what's missing? (code, not model judgement, so nothing is silently assumed) ----------
 
